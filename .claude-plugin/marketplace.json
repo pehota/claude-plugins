@@ -1,0 +1,13 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "claude-plugins",
+  "description": "A curated collection of Claude Code plugins",
+  "owner": {
+    "name": "Dimitar Apostolov",
+    "email": "d.apostolov@gmail.com"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": []
+}
