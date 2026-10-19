@@ -45,10 +45,13 @@ VERBS="brief-path contract-write contract-read state-set diff-hash cache-get cac
 #   outside quotes: any char but ; & | < > ( ) $ ` \ * ? [ ] { } ~ # ' " LF CR
 #   '…'           : anything but '
 #   "…"           : anything but " $ ` \ LF CR
-ARGS_RE=$(cat <<'EOF'
+# Read via `read`, not $(cat <<'EOF' …): bash 3.2 (macOS /bin/bash) mis-parses
+# the unbalanced quotes of a heredoc inside $( ), so the whole script failed
+# with a syntax error — exit 2, which blocks the tool call.
+IFS= read -r -d '' ARGS_RE <<'EOF'
 \A(?:[^;&|<>()$`\\*?\[\]{}~#'"\n\r]|'[^']*'|"[^"$`\\\n\r]*")*+\z
 EOF
-)
+ARGS_RE=${ARGS_RE%$'\n'}
 
 # shellcheck disable=SC2016
 jq -e -s --arg root "$ROOT" --arg root_p "$ROOT_P" --arg verbs "$VERBS" --arg re "$ARGS_RE" --arg sq "'" '
