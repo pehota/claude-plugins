@@ -9,7 +9,11 @@ Baseline requirements every contract folds in: [`base-dod.md`](base-dod.md).
 ## Usage
 
 - `/dod:define [task]` — open a DoD contract before implementation starts.
-  Self-invoked by the agent; run it yourself if it forgets. Clarifies an
+  Self-invoked by the agent; run it yourself if it forgets. One exception:
+  for a trivial non-behavioural change (a comment, wording, a typo — never
+  logic, config or agent/skill text) the agent may ask "Skip DoD for this?";
+  only your explicit yes skips it, and no contract is opened. Never
+  proposed when you ran `/dod:define` yourself. Clarifies an
   ambiguous task first, spawns a fresh `dod-context-collector` to write the
   context brief (the project standards and invariants relevant to this
   task, at `.dod/<key>/brief.md`) the moment the task is agreed, records

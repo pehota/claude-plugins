@@ -1,6 +1,6 @@
 ---
 name: dod-define
-description: Open a Definition-of-Done contract for the current task before implementation begins. Invoke as /dod:define [task text]. MANDATORY self-invoke, before your first edit, the moment a task is clear — do not wait to be asked, do not treat this as optional.
+description: Open a Definition-of-Done contract for the current task before implementation begins. Invoke as /dod:define [task text]. MANDATORY self-invoke, before your first edit, the moment a task is clear — do not wait to be asked, do not treat this as optional. Sole exception: a trivial non-behavioural change (comment, wording, typo) the user explicitly agreed to skip.
 ---
 
 # /dod:define
@@ -13,7 +13,9 @@ chain: **agree the task → "how will we know it works?" (`works_when`) →
 Run this yourself, before your first edit, every time a task's shape is
 clear — the same way you self-invoke `/dod:verify` when you believe the
 task is done. `track.sh`'s nudge and the user running it themselves are the
-safety net for when you fail, not the plan.
+safety net for when you fail, not the plan. The one exception is a trivial
+change the **user** agrees to skip (step 2, "Trivial — propose a skip"); you
+may propose it, never decide it.
 
 ## Steps
 
@@ -45,6 +47,28 @@ so it runs without a permission prompt (`dod/README.md`).
    the user concrete clarifying questions and stop — no table, no contract —
    until the task is clear and agreed. If the conversation already settled
    it, proceed without re-asking.
+
+   **Trivial — propose a skip, never take one.** Before spawning the
+   collector, check whether the agreed task meets ALL of:
+   - (a) no runtime behaviour changes — a comment, doc/prose wording, a
+     typo, or a string nothing executes;
+   - (b) no logic, config value, flag, dependency, or API/schema change;
+   - (c) small and fully known before the first edit (e.g. one file, a few
+     lines).
+
+   Agent, prompt and skill text is behaviour (step 4), so it never
+   qualifies, and neither does a task the user ran `/dod:define` on
+   themselves — they already chose. Nor does it apply while a contract is
+   already open, including the amend path ("If a contract is already open
+   for this branch"): a skip has no effect there, since `track.sh` and the
+   gate still enforce the open contract. If all three hold, you may ask in
+   one line — "Trivial: <reason>. Skip DoD for this?" — and wait. Only the
+   user's explicit yes skips it: stop here, open no contract, make the
+   change, then run the cheap checks that apply (e.g. the formatter) and
+   report them. No answer, any doubt, or any condition failing → continue
+   with the collector as usual. This is the same rule as waivers (step 5):
+   you may propose, only the user's words grant it; skipping because a task
+   "looks small" without asking is the silent-skip failure mode.
 
    **The moment the task is agreed — and not before — spawn
    `dod-context-collector`**, before you write `works_when`. Use the `Task`

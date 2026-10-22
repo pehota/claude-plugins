@@ -45,6 +45,10 @@ case "$CTX" in
   *"no Definition of Done"*) ok "no contract: nudge in hookSpecificOutput.additionalContext" ;;
   *) bad "no contract: nudge in hookSpecificOutput.additionalContext" "$OUT" ;;
 esac
+case "$CTX" in
+  *"the user agreed to skip DoD for this specific trivial change"*) ok "no contract: nudge leaves room for a user-agreed trivial skip" ;;
+  *) bad "no contract: nudge leaves room for a user-agreed trivial skip" "$CTX" ;;
+esac
 EVENT_NAME=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.hookEventName // ""' 2>/dev/null)
 eq "no contract: hookEventName is PostToolUse" "PostToolUse" "$EVENT_NAME"
 NO_SYSMSG=$(printf '%s' "$OUT" | jq -r '.systemMessage // "absent"' 2>/dev/null)

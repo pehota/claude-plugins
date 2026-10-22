@@ -111,7 +111,7 @@ STATE_FILE="$DOD_DIR/state.json"
 # --- no contract open -> nudge, non-blocking ---------------------------------
 if [ ! -f "$CONTRACT_FILE" ]; then
   jq -n '{hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext:
-    "dod: no Definition of Done is open for this task. Run /dod:define before continuing, or ignore this if the edit is unrelated to a task."}}' 2>/dev/null
+    "dod: no Definition of Done is open for this task. Run /dod:define before continuing, unless the edit is unrelated to a task or the user agreed to skip DoD for this specific trivial change."}}' 2>/dev/null
   exit 0
 fi
 

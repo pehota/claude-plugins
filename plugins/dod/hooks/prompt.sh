@@ -77,5 +77,5 @@ if [ -f "$CONTRACT_FILE" ]; then
 fi
 
 jq -n '{hookSpecificOutput: {hookEventName: "UserPromptSubmit", additionalContext:
-  "dod: no Definition of Done is open for this task. If this prompt starts or continues implementation work, self-invoke /dod:define before making any edits."}}' 2>/dev/null
+  "dod: no Definition of Done is open for this task. If this prompt starts or continues implementation work, self-invoke /dod:define before making any edits, unless the user agreed to skip DoD for this specific trivial change."}}' 2>/dev/null
 exit 0

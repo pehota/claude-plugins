@@ -18,9 +18,10 @@ for the gate to block first, and do not ask the user whether you should run
 it — not even for a trivial diff (a comment, a rename, a one-line change).
 There is no diff small enough to justify checking in first: asking is the
 same skipped-self-invoke failure mode as never running it at all, just
-phrased as a question instead of silence. A block is the fallback for when
-this was skipped, not the intended trigger, and neither is a permission
-check.
+phrased as a question instead of silence. (This is distinct from
+`/dod:define`'s trivial-skip proposal, which happens before any contract
+exists.) A block is the fallback for when this was skipped, not the
+intended trigger, and neither is a permission check.
 
 **Settle your own observations first.** Before running `/dod:verify`,
 handle every note an implementer subagent returned and everything you

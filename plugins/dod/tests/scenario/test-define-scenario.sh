@@ -9,6 +9,14 @@
 #       clarifies with the user first, writes no contract.
 #   (c) the same ambiguous task, already settled in the conversation: does
 #       not re-ask, proceeds to works_when + requirements.
+#   (d) comment-only typo fix, self-invoked (the user did not run
+#       /dod:define): proposes skipping DoD in one question and stops — no
+#       collector spawn, no contract, and no edit action before the user's
+#       yes.
+#   (e) skill-text typo fix, self-invoked the same way: proves skill text
+#       never qualifies for the skip — no skip question, the collector is
+#       spawned. ((a) cannot prove this: the user ran /dod:define there,
+#       which rules out a skip proposal on its own.)
 #   (a)+(c) also: dod-context-collector is spawned first — once the task is
 #       clear, before works_when — its verdict is relayed above the table,
 #       and contract_write carries it as --brief. (b) spawns nothing.
@@ -92,6 +100,20 @@ $REPO_FACTS
 
 $REPLY_SHAPE"
 
+PROMPT_D="You are self-invoking this skill (the user did not run /dod:define) for the user's request: fix the typo \"recieve\" -> \"receive\" in the comment on line 12 of dod/lib/io.sh.
+
+$REPO_FACTS
+- Line 12 of dod/lib/io.sh is a \`#\` comment; nothing else changes.
+
+$REPLY_SHAPE"
+
+PROMPT_E="You are self-invoking this skill (the user did not run /dod:define) for the user's request: fix the typo \"recieve\" -> \"receive\" in one prose sentence of dod/skills/dod-verify/SKILL.md.
+
+$REPO_FACTS
+- The sentence is instruction text the agent reads; nothing else changes.
+
+$REPLY_SHAPE"
+
 # define__reqs — the reply's --requirements as a JSON array ("[]" if absent).
 define__reqs() {
   printf '%s' "$1" | jq -c '(.contract_write // {})["--requirements"] // [] | if type == "string" then fromjson else . end' 2>/dev/null || echo '[]'
@@ -167,6 +189,26 @@ assert_settled_ambiguous() {
   define__assert_collector "$reply"
 }
 
+assert_trivial_proposes_skip() {
+  local reply cw edits
+  reply=$(cat)
+  printf '%s' "$reply" | jq -e . >/dev/null 2>&1 || { echo "reply is not JSON"; return 1; }
+  printf '%s' "$reply" | jq -r '.clarifying_questions // [] | join("\n")' | grep -qi 'skip' || { echo "did not ask the user whether to skip DoD"; return 1; }
+  cw=$(printf '%s' "$reply" | jq -r '.contract_write // empty | tostring')
+  [ -z "$cw" ] || { echo "wrote a contract while the skip question is open"; return 1; }
+  [ "$(printf '%s' "$reply" | jq '.spawned_agents // [] | length')" -eq 0 ] || { echo "spawned a subagent before the user answered the skip question"; return 1; }
+  edits=$(printf '%s' "$reply" | jq -r '[.actions_in_order // [] | .[] | select(test("edit|fix|change|write"; "i") and (test("ask"; "i") | not))] | join("; ")')
+  [ -z "$edits" ] || { echo "acted before the user's yes: $edits"; return 1; }
+}
+
+assert_skill_text_no_skip() {
+  local reply
+  reply=$(cat)
+  printf '%s' "$reply" | jq -e . >/dev/null 2>&1 || { echo "reply is not JSON"; return 1; }
+  ! printf '%s' "$reply" | jq -r '.clarifying_questions // [] | join("\n")' | grep -qi 'skip' || { echo "proposed skipping DoD for a skill-text change"; return 1; }
+  define__assert_collector "$reply"
+}
+
 fail=0
 echo "== scenario (a): settled skill-text task -> works_when, proofs, scenario applies ($SKILL) =="
 scenario_run assert_settled_skill_change "$SYS" "$PROMPT_A" || fail=1
@@ -174,4 +216,8 @@ echo "== scenario (b): ambiguous task -> clarify, no contract ($SKILL) =="
 scenario_run assert_ambiguous_clarifies "$SYS" "$PROMPT_B" || fail=1
 echo "== scenario (c): ambiguous task already settled -> no re-ask, proceeds ($SKILL) =="
 scenario_run assert_settled_ambiguous "$SYS" "$PROMPT_C" || fail=1
+echo "== scenario (d): self-invoked comment-only change -> proposes skip, no contract ($SKILL) =="
+scenario_run assert_trivial_proposes_skip "$SYS" "$PROMPT_D" || fail=1
+echo "== scenario (e): self-invoked skill-text change -> no skip proposal, collector spawned ($SKILL) =="
+scenario_run assert_skill_text_no_skip "$SYS" "$PROMPT_E" || fail=1
 exit $fail
