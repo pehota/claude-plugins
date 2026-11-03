@@ -113,6 +113,59 @@ dod_diff_hash() {
   } | git hash-object --stdin 2>/dev/null
 }
 
+# dod_snapshot <repo_dir> — prints the SHA of a commit whose tree is the
+# current working tree: tracked changes plus untracked non-ignored files,
+# .dod/ excluded at any depth (same enumeration rule as
+# gitref__changed_paths). Parent = HEAD. Non-zero and prints nothing on
+# failure.
+#
+# Why a commit, not dod_diff_hash: the diff hash is a content fingerprint no
+# `git diff` can resolve. /dod:verify stores a snapshot per round (result.json
+# snapshot_sha) so round 2+ can hand dod-reviewer two real commits and it
+# reviews exactly `git diff <prior snapshot> <current snapshot>`.
+#
+# Never touches the caller's index or working tree: everything runs against a
+# temporary GIT_INDEX_FILE, seeded from a copy of the real index (its stat
+# cache spares re-hashing every unchanged file; `add -A` then makes it match
+# the working tree anyway), or from HEAD when there is no index yet; any
+# .dod/ entry the seed carried (staged, or tracked at HEAD) is dropped, so a
+# snapshot tree never holds .dod/ at all. A fixed
+# identity, set via env, works in repos with no user.name/email; signing is
+# off so a commit.gpgSign config cannot prompt or fail.
+#
+# ponytail: the commit is left dangling (no ref). Unreachable objects can be
+# pruned by `git gc` after its grace period (2 weeks by default); a prior
+# snapshot that no longer resolves just degrades the next review to full
+# mode. If that ever bites, keep a ref under refs/dod/ per task.
+dod_snapshot() {
+  local repo tmp idx real_idx head tree sha
+  [ -n "$1" ] || return 1
+  repo=$(dod_repo_root "$1")
+  head=$(git -C "$repo" rev-parse -q --verify HEAD 2>/dev/null) || return 1
+  tmp=$(mktemp -d 2>/dev/null) || return 1
+  [ -n "$tmp" ] || return 1
+  idx="$tmp/index"
+  real_idx=$(git -C "$repo" rev-parse --git-path index 2>/dev/null)
+  case "$real_idx" in ''|/*) ;; *) real_idx="$repo/$real_idx" ;; esac
+  if [ -n "$real_idx" ] && [ -f "$real_idx" ]; then
+    cp "$real_idx" "$idx" 2>/dev/null
+  else
+    GIT_INDEX_FILE="$idx" git -C "$repo" read-tree "$head" >/dev/null 2>&1
+  fi
+  if [ -f "$idx" ] \
+    && GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . ':(exclude,glob)**/.dod/**' >/dev/null 2>&1 \
+    && GIT_INDEX_FILE="$idx" git -C "$repo" rm -r -q --cached --ignore-unmatch -- ':(glob)**/.dod/**' >/dev/null 2>&1; then
+    tree=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree 2>/dev/null)
+  fi
+  rm -rf "$tmp" 2>/dev/null
+  [ -n "$tree" ] || return 1
+  sha=$(GIT_AUTHOR_NAME=dod GIT_AUTHOR_EMAIL=dod@localhost \
+        GIT_COMMITTER_NAME=dod GIT_COMMITTER_EMAIL=dod@localhost \
+        git -C "$repo" commit-tree --no-gpg-sign -p "$head" -m "dod snapshot" "$tree" 2>/dev/null)
+  [ -n "$sha" ] || return 1
+  printf '%s\n' "$sha"
+}
+
 # dod_changed_standards <repo_dir> <baseline_sha> — JSON array of
 # repo-relative paths changed since baseline (committed, staged, unstaged,
 # untracked; .dod/ excluded, same enumeration as dod_diff_hash) that name a

@@ -58,8 +58,8 @@ reads and writes the same `.dod/`.
 The skills run every dod step as one Bash call to the plugin's own CLI,
 `bash "<plugin root>/scripts/dod.sh" <verb> [args]` (verbs: `brief-path`,
 `contract-write`, `contract-read`, `state-set`, `diff-hash`, `cache-get`,
-`cache-set`, `baseline-worktree`, `changed-standards`, `result-write`,
-`record-decisions`, `claim`; `brief-path` doubles as `/dod:define`'s
+`cache-set`, `baseline-worktree`, `changed-standards`, `snapshot`,
+`result-write`, `record-decisions`, `claim`; `brief-path` doubles as `/dod:define`'s
 preflight — it fails outside a git repo or without `jq`). The CLI resolves the repo and task key itself
 and delegates to `lib/*.sh` — each Bash call is a fresh shell, so no
 variables are carried between calls.

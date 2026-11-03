@@ -42,6 +42,7 @@ cli frobnicate
 eq "unknown verb: exit" "2" "$RC"
 case "$ERR" in *usage:*) ok "unknown verb: usage on stderr" ;; *) bad "unknown verb: usage on stderr" "$ERR" ;; esac
 eq "unknown verb: nothing on stdout" "" "$OUT"
+case "$ERR" in *snapshot*) ok "usage lists the snapshot verb" ;; *) bad "usage lists the snapshot verb" "$ERR" ;; esac
 cli
 eq "no verb: exit" "2" "$RC"
 
@@ -95,6 +96,8 @@ eq "contract-read: requirements" "4" "$(printf '%s' "$OUT" | jq -r '.requirement
 eq "contract-read: repo is the top-level" "$ROOT" "$(printf '%s' "$OUT" | jq -r '.repo')"
 eq "contract-read: state" "idle" "$(printf '%s' "$OUT" | jq -r '.state.state')"
 eq "contract-read: no result yet" "null" "$(printf '%s' "$OUT" | jq -r '.result')"
+eq "contract-read: next_review with no result -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(printf '%s' "$OUT" | jq -c '.next_review')"
 
 # explicit --baseline-sha (the amend path) is kept, not replaced by HEAD
 echo more >> "$ROOT/root.txt"; git -C "$ROOT" commit -qam second
@@ -172,6 +175,62 @@ cli result-write '[]'
 cli contract-read
 eq "contract-read: carries the latest result's round" "2" "$(printf '%s' "$OUT" | jq -r '.result.round')"
 eq "contract-read: carries the advisory ids" '["a1"]' "$(printf '%s' "$OUT" | jq -c '.result.advisory_ids')"
+
+# --- snapshot: a real commit per round, so round 2+ can review only the delta
+# Guards the delta_reconfirm bug: delta_from used to be the prior diff_hash,
+# a content fingerprint no `git diff` can resolve, so every round 2+ silently
+# became a full review. result-write now records snapshot_sha; `snapshot`
+# gives the current one; their diff is exactly what changed in between.
+result_read "$KEY_DIR/result.json"
+R1_SNAP="$RESULT_SNAPSHOT_SHA"
+eq "result-write: snapshot_sha is a commit" "commit" "$(git -C "$ROOT" cat-file -t "$R1_SNAP" 2>/dev/null)"
+cli contract-read
+eq "contract-read: carries the result's snapshot_sha" "$R1_SNAP" "$(printf '%s' "$OUT" | jq -r '.result.snapshot_sha')"
+echo changed >> "$ROOT/root.txt"
+echo brand-new > "$SUB/g.txt"
+cli snapshot
+eq "snapshot: exit" "0" "$RC"
+eq "snapshot: delta since round 1 = edited tracked + new untracked" "root.txt sub/g.txt" \
+  "$(git -C "$ROOT" diff --name-only "$R1_SNAP" "$OUT" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+eq "snapshot: real index untouched" "" "$(git -C "$ROOT" diff --cached --name-only)"
+
+# --- review.reconfirm persists: round 3+ re-checks a still-present finding ---
+# Guards the dropped-reconfirm bug: only the reviewer's `findings` were
+# stored, so a round-1 blocker the round-2 reviewer reported still_present
+# (outside the delta, so not in `findings`) vanished from round 3's reconfirm.
+# --- next_review: contract-read computes the next round's inputs (f1) -------
+# Guards f1: round choice and reconfirm list used to be skill text the model
+# followed; contract-read now hands them over ready to pass verbatim.
+cli contract-read
+eq "contract-read: next_review after a passing review -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(printf '%s' "$OUT" | jq -c '.next_review')"
+FAIL_REQS='[{"id":"review","type":"judgement","verdict":"fail","findings":[{"id":"f1","severity":"blocking","lens":"correctness","file":"a.sh","line":3,"summary":"bug"}]}]'
+cli result-write --requirements "$FAIL_REQS"
+result_read "$KEY_DIR/result.json"
+FAIL_SNAP="$RESULT_SNAPSHOT_SHA"
+cli contract-read
+eq "contract-read: next_review after a failing review -> delta_reconfirm from its snapshot" \
+  "{\"mode\":\"delta_reconfirm\",\"reconfirm\":[{\"id\":\"f1\",\"file\":\"a.sh\",\"line\":3,\"summary\":\"bug\"}],\"delta_from\":\"$FAIL_SNAP\"}" \
+  "$(printf '%s' "$OUT" | jq -c '.next_review')"
+
+# --- review.reconfirm persists: round 3+ re-checks a still-present finding ---
+# Guards the dropped-reconfirm bug: only the reviewer's `findings` were
+# stored, so a round-1 blocker the round-2 reviewer reported still_present
+# (outside the delta, so not in `findings`) vanished from round 3's reconfirm.
+# The reviewer's reply carries only id/status/evidence; result-write fills
+# file/line/summary from the prior round's reconfirm list (f1).
+RECONFIRM_REQS='[{"id":"review","type":"judgement","verdict":"fail","findings":[],"reconfirm":[{"id":"f1","status":"still_present","evidence":"a.sh:3 unchanged"}]}]'
+cli result-write --requirements "$RECONFIRM_REQS"
+eq "result-write: reconfirm-only fail -> exit" "0" "$RC"
+cli contract-read
+eq "result-write: reconfirm entry enriched with the prior item's file/line/summary" \
+  '[{"id":"f1","status":"still_present","evidence":"a.sh:3 unchanged","file":"a.sh","line":3,"summary":"bug"}]' \
+  "$(printf '%s' "$OUT" | jq -c '[.result.requirements[] | select(.id == "review") | .reconfirm[]]')"
+eq "contract-read: next_review carries the still-present blocker" \
+  '[{"id":"f1","file":"a.sh","line":3,"summary":"bug"}]' "$(printf '%s' "$OUT" | jq -c '.next_review.reconfirm')"
+result_read "$KEY_DIR/result.json"
+eq "result-write: reconfirm-only fail still blocks" "1" "$RESULT_BLOCKING_FAIL"
+cli result-write --requirements "$PASS_REQS"   # restore the advisory result the tests below decide on
 
 # --- record-decisions ---------------------------------------------------------
 state_disarm_latch "$KEY_DIR/state.json"

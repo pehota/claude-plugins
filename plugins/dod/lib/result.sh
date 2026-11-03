@@ -38,16 +38,21 @@ result__validate_requirements() {
 }
 
 # result_write <path> --diff-hash H --baseline-sha SHA --round N
-#                      --requirements JSON_ARR
+#                      [--snapshot-sha SHA] --requirements JSON_ARR
+#
+# snapshot_sha: the dod_snapshot commit of the working tree this round
+# verified — round 2+ diffs against it to review only the delta. Empty when
+# the snapshot could not be taken (the next round then reviews in full).
 result_write() {
   local result_path="$1"; shift
-  local diff_hash="" baseline_sha="" round="0" requirements="[]"
+  local diff_hash="" baseline_sha="" round="0" snapshot_sha="" requirements="[]"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --diff-hash) diff_hash="$2"; shift 2 ;;
       --baseline-sha) baseline_sha="$2"; shift 2 ;;
       --round) round="$2"; shift 2 ;;
+      --snapshot-sha) snapshot_sha="$2"; shift 2 ;;
       --requirements) requirements="$2"; shift 2 ;;
       *) shift ;;
     esac
@@ -64,11 +69,13 @@ result_write() {
     --arg diff_hash "$diff_hash" \
     --arg baseline_sha "$baseline_sha" \
     --argjson round "$round" \
+    --arg snapshot_sha "$snapshot_sha" \
     --argjson requirements "$requirements" \
     '{
       diff_hash: $diff_hash,
       baseline_sha: $baseline_sha,
       round: $round,
+      snapshot_sha: $snapshot_sha,
       requirements: $requirements,
       summary: {
         pass: [$requirements[] | select(.verdict == "pass")] | length,
@@ -84,13 +91,15 @@ result_write() {
 # array of the advisory findings' ids across judgement requirements, unique
 # and non-null — result__validate_requirements already rejects a null/missing
 # id, `unique` here only guards against an accidental duplicate id so
-# state_record_decisions never sees the same id twice). Returns 1 on
+# state_record_decisions never sees the same id twice; RESULT_SNAPSHOT_SHA:
+# empty for a legacy result written before snapshot_sha existed). Returns 1 on
 # missing/malformed/invalid, without setting stale globals.
 result_read() {
   local result_path="$1"
   RESULT_DIFF_HASH=""
   RESULT_BASELINE_SHA=""
   RESULT_ROUND=""
+  RESULT_SNAPSHOT_SHA=""
   RESULT_REQUIREMENTS="[]"
   RESULT_BLOCKING_FAIL=""
   RESULT_ADVISORY_IDS="[]"
@@ -107,6 +116,7 @@ result_read() {
   RESULT_DIFF_HASH=$(jq -r '.diff_hash // ""' "$result_path" 2>/dev/null)
   RESULT_BASELINE_SHA=$(jq -r '.baseline_sha // ""' "$result_path" 2>/dev/null)
   RESULT_ROUND=$(jq -r '.round // 0' "$result_path" 2>/dev/null)
+  RESULT_SNAPSHOT_SHA=$(jq -r '.snapshot_sha // ""' "$result_path" 2>/dev/null)
   RESULT_REQUIREMENTS="$reqs"
   RESULT_BLOCKING_FAIL=$(jq -r '.summary.blocking_fail // 0' "$result_path" 2>/dev/null)
   RESULT_ADVISORY_IDS=$(printf '%s' "$reqs" | jq -c '[.[] | select(.type == "judgement") | .findings[]? | select(.severity == "advisory") | .id] | unique' 2>/dev/null)
@@ -133,3 +143,60 @@ result_next_round() {
   echo 1
 }
 
+
+# result_next_review <prior_path> <baseline_sha> — prints the next review's
+# inputs as one JSON object {mode, reconfirm, delta_from} (D15/D16; /dod:verify
+# passes them to dod-reviewer verbatim):
+#   mode       "delta_reconfirm" when the prior result belongs to this
+#              contract (same baseline_sha), its `review` verdict is "fail"
+#              and it has no creep stop (RESULT_CREEP_IDS empty); else "full".
+#              Keyed on the verdict, not on blocking findings — a review can
+#              fail through `reconfirm` alone (findings: []).
+#   reconfirm  delta_reconfirm only, else []: the prior review's blocking
+#              non-scope findings, then its reconfirm entries whose status is
+#              not "fixed", as {id, file, line, summary}, deduped by id (first
+#              wins). Scope findings stay out — the scope lens re-runs fresh.
+#   delta_from delta_reconfirm only, else "": the prior snapshot_sha ("" for a
+#              legacy result without one — the reviewer then reviews in full).
+result_next_review() {
+  local prior="$1" baseline_sha="$2"
+  local full='{"mode":"full","reconfirm":[],"delta_from":""}'
+  if ! result_read "$prior" || [ "$RESULT_BASELINE_SHA" != "$baseline_sha" ] \
+    || [ "$RESULT_CREEP_IDS" != "[]" ]; then
+    printf '%s\n' "$full"
+    return 0
+  fi
+  printf '%s' "$RESULT_REQUIREMENTS" | jq -c --arg delta_from "$RESULT_SNAPSHOT_SHA" '
+    (first(.[] | select(.id == "review")) // null) as $review
+    | if $review == null or $review.verdict != "fail" then
+        {mode: "full", reconfirm: [], delta_from: ""}
+      else
+        ([($review.findings // [])[] | select(.severity == "blocking" and .lens != "scope")]
+         + [($review.reconfirm // [])[] | select(.status != "fixed")]) as $carried
+        | {mode: "delta_reconfirm",
+           reconfirm: ($carried
+             | map({id, file, line, summary})
+             | reduce .[] as $item ([]; if any(.[]; .id == $item.id) then . else . + [$item] end)),
+           delta_from: $delta_from}
+      end'
+}
+
+# result_enrich_reconfirm <prior_path> <baseline_sha> <requirements_json> —
+# prints the requirements with each `review` reconfirm entry's missing
+# file/line/summary filled from the prior result's result_next_review
+# reconfirm item of the same id (the reviewer replies with id/status/evidence
+# only). Present fields and items without a prior match are kept as given.
+# Must run before result_write overwrites the prior result. Unparseable input
+# is printed unchanged, for result_write's validation to reject.
+result_enrich_reconfirm() {
+  local prior="$1" baseline_sha="$2" reqs="$3" prior_items enriched
+  prior_items=$(result_next_review "$prior" "$baseline_sha" | jq -c '.reconfirm' 2>/dev/null)
+  enriched=$(printf '%s' "$reqs" | jq -c --argjson prior "${prior_items:-[]}" '
+    map(if .id == "review" and ((.reconfirm | type) == "array") then
+          .reconfirm |= map(. as $item
+            | (first($prior[] | select(.id == $item.id)) // {}) as $match
+            | reduce ("file", "line", "summary") as $key ($item;
+                if .[$key] == null and $match[$key] != null then .[$key] = $match[$key] else . end))
+        else . end)' 2>/dev/null) || enriched=""
+  printf '%s\n' "${enriched:-$reqs}"
+}

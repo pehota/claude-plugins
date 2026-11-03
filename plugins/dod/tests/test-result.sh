@@ -173,6 +173,110 @@ eq "creep ids: gap-only result has none" "[]" "$RESULT_CREEP_IDS"
 
 eq "creep ids: check-only result has none" "[]" "$(result_read "$RFILE" && printf '%s' "$RESULT_CREEP_IDS")"
 
+# --- snapshot_sha -------------------------------------------------------------
+SNAP_FILE="$REPO/.dod/main/snap-result.json"
+result_write "$SNAP_FILE" --diff-hash "x" --baseline-sha "y" --round 1 \
+  --snapshot-sha "0123abcd" --requirements '[]'
+result_read "$SNAP_FILE"
+eq "round-trip snapshot_sha" "0123abcd" "$RESULT_SNAPSHOT_SHA"
+# legacy result (written before snapshot_sha existed) reads as empty
+LEGACY_FILE="$REPO/.dod/main/legacy-result.json"
+printf '%s' '{"diff_hash":"x","baseline_sha":"y","round":1,"requirements":[],"summary":{"blocking_fail":0}}' > "$LEGACY_FILE"
+result_read "$LEGACY_FILE"
+eq "legacy result: snapshot_sha empty" "" "$RESULT_SNAPSHOT_SHA"
+# a failed read never leaves a stale snapshot sha
+result_read "$SNAP_FILE"; result_read "$REPO/.dod/main/missing.json"
+eq "failed read: snapshot_sha reset" "" "$RESULT_SNAPSHOT_SHA"
+
+# --- result_next_review: the next review's mode, reconfirm and delta_from ---
+# Guards f1: which round and what reconfirm holds used to be skill text the
+# model followed (and got wrong); now code computes it (D15/D16).
+NR_DIR="$REPO/.dod/nr"; mkdir -p "$NR_DIR"
+# nr_write <name> <requirements> [snapshot] — a prior result on baseline "y"
+nr_write() {
+  result_write "$NR_DIR/$1.json" --diff-hash "x" --baseline-sha "y" --round 1 \
+    --snapshot-sha "${3:-snap1}" --requirements "$2"
+}
+nr() { result_next_review "$NR_DIR/$1.json" "${2:-y}"; }
+
+eq "next review: no prior result -> full, no reconfirm" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(nr no-such)"
+eq "next review: malformed prior -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(result_next_review "$BADFILE" "y")"
+
+nr_write pass '[{"id":"review","type":"judgement","verdict":"pass","findings":[
+  {"id":"a1","severity":"advisory","lens":"standards","file":"a.ts","line":1,"summary":"nit"}]}]'
+eq "next review: prior review passed -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(nr pass)"
+
+nr_write findings '[{"id":"tests","type":"check","verdict":"pass","cmd":"t","exit":0},
+  {"id":"review","type":"judgement","verdict":"fail","findings":[
+  {"id":"f1","severity":"blocking","lens":"correctness","file":"a.ts","line":3,"summary":"bug","failure_scenario":"x"},
+  {"id":"g1","severity":"blocking","lens":"scope","kind":"gap","file":"b.ts","line":1,"summary":"gap"},
+  {"id":"a1","severity":"advisory","lens":"standards","file":"c.ts","line":2,"summary":"nit"}]}]'
+eq "next review: baseline mismatch -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(nr findings other-baseline)"
+eq "next review: fail via findings -> delta_reconfirm, blocking non-scope only, delta_from = snapshot" \
+  '{"mode":"delta_reconfirm","reconfirm":[{"id":"f1","file":"a.ts","line":3,"summary":"bug"}],"delta_from":"snap1"}' \
+  "$(nr findings)"
+
+nr_write creep '[{"id":"review","type":"judgement","verdict":"fail","findings":[
+  {"id":"c1","severity":"blocking","lens":"scope","kind":"creep","file":"a.ts","line":1,"summary":"creep"},
+  {"id":"f1","severity":"blocking","lens":"correctness","file":"a.ts","line":3,"summary":"bug"}]}]'
+eq "next review: creep stop -> full" \
+  '{"mode":"full","reconfirm":[],"delta_from":""}' "$(nr creep)"
+
+nr_write reconfonly '[{"id":"review","type":"judgement","verdict":"fail","findings":[],"reconfirm":[
+  {"id":"f1","file":"a.ts","line":3,"summary":"bug","status":"still_present","evidence":"unchanged"},
+  {"id":"f2","file":"b.ts","line":5,"summary":"leak","status":"fixed","evidence":"guarded"},
+  {"id":"f3","file":"c.ts","line":7,"summary":"race","status":"unverifiable","evidence":"no repro"}]}]'
+eq "next review: fail via reconfirm only -> still_present/unverifiable carried, fixed dropped" \
+  '{"mode":"delta_reconfirm","reconfirm":[{"id":"f1","file":"a.ts","line":3,"summary":"bug"},{"id":"f3","file":"c.ts","line":7,"summary":"race"}],"delta_from":"snap1"}' \
+  "$(nr reconfonly)"
+
+nr_write dedupe '[{"id":"review","type":"judgement","verdict":"fail","findings":[
+  {"id":"f1","severity":"blocking","lens":"impact","file":"new.ts","line":9,"summary":"from findings"}],"reconfirm":[
+  {"id":"f1","file":"old.ts","line":1,"summary":"from reconfirm","status":"still_present","evidence":"e"},
+  {"id":"f0","file":"z.ts","line":2,"summary":"older","status":"still_present","evidence":"e"}]}]'
+eq "next review: deduped by id, first (findings) wins" \
+  '[{"id":"f1","file":"new.ts","line":9,"summary":"from findings"},{"id":"f0","file":"z.ts","line":2,"summary":"older"}]' \
+  "$(nr dedupe | jq -c '.reconfirm')"
+
+# legacy result: no snapshot_sha, review entry without reconfirm
+printf '%s' '{"diff_hash":"x","baseline_sha":"y","round":1,"requirements":[{"id":"review","type":"judgement","verdict":"fail","findings":[{"id":"f1","severity":"blocking","file":"a.ts","line":3,"summary":"bug"}]}],"summary":{"blocking_fail":1}}' \
+  > "$NR_DIR/legacy.json"
+eq "next review: legacy result -> delta_reconfirm, delta_from empty, reconfirm from findings" \
+  '{"mode":"delta_reconfirm","reconfirm":[{"id":"f1","file":"a.ts","line":3,"summary":"bug"}],"delta_from":""}' \
+  "$(nr legacy)"
+
+# --- result_enrich_reconfirm: file/line/summary filled from the prior list --
+# Guards f1: the model copied the reviewer's reconfirm reply onto the review
+# entry but dropped file/line/summary, so round 3's reconfirm lost them.
+REPLY='[{"id":"tests","type":"check","verdict":"pass","cmd":"t","exit":0},
+  {"id":"review","type":"judgement","verdict":"fail","findings":[],"reconfirm":[
+  {"id":"f1","status":"still_present","evidence":"a.ts:3 unchanged"},
+  {"id":"f3","file":"kept.ts","line":70,"summary":"own","status":"fixed","evidence":"e"},
+  {"id":"zz","status":"still_present","evidence":"no prior match"}]}]'
+ENRICHED=$(result_enrich_reconfirm "$NR_DIR/reconfonly.json" "y" "$REPLY")
+eq "enrich: missing file/line/summary filled from the prior item, status/evidence kept" \
+  '{"id":"f1","status":"still_present","evidence":"a.ts:3 unchanged","file":"a.ts","line":3,"summary":"bug"}' \
+  "$(printf '%s' "$ENRICHED" | jq -c '.[1].reconfirm[0]')"
+eq "enrich: fields already present are kept" \
+  '{"id":"f3","file":"kept.ts","line":70,"summary":"own","status":"fixed","evidence":"e"}' \
+  "$(printf '%s' "$ENRICHED" | jq -c '.[1].reconfirm[1]')"
+eq "enrich: no prior match -> item unchanged" \
+  '{"id":"zz","status":"still_present","evidence":"no prior match"}' \
+  "$(printf '%s' "$ENRICHED" | jq -c '.[1].reconfirm[2]')"
+eq "enrich: other requirements unchanged" \
+  "$(printf '%s' "$REPLY" | jq -c '.[0]')" "$(printf '%s' "$ENRICHED" | jq -c '.[0]')"
+NOREC='[{"id":"review","type":"judgement","verdict":"pass","findings":[]}]'
+eq "enrich: review entry without reconfirm unchanged" \
+  "$(printf '%s' "$NOREC" | jq -c '.')" "$(result_enrich_reconfirm "$NR_DIR/reconfonly.json" "y" "$NOREC" | jq -c '.')"
+eq "enrich: no prior result -> unchanged" \
+  "$(printf '%s' "$REPLY" | jq -c '.')" "$(result_enrich_reconfirm "$NR_DIR/no-such.json" "y" "$REPLY" | jq -c '.')"
+eq "enrich: invalid JSON passed through as given (result_write rejects it)" \
+  "not json" "$(result_enrich_reconfirm "$NR_DIR/reconfonly.json" "y" "not json")"
+
 echo
 echo "result.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

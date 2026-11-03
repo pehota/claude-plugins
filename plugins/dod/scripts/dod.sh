@@ -24,14 +24,23 @@
 #   contract-write <flags…>       contract_write flags; path and --task-key are
 #                                 computed, --baseline-sha defaults to HEAD,
 #                                 --session-id to $CLAUDE_CODE_SESSION_ID
-#   contract-read                 contract + state (+ latest result) as JSON
+#   contract-read                 contract + state (+ latest result) as JSON,
+#                                 plus next_review {mode, reconfirm, delta_from}
+#                                 (result_next_review) for /dod:verify step 5
 #   state-set <idle|verifying>
 #   diff-hash                     diff hash against the contract baseline
 #   cache-get <cmd>               cached verdict (pass|fail), or "miss"
 #   cache-set <cmd> <pass|fail>
 #   baseline-worktree             path of the baseline worktree (created lazily)
 #   changed-standards             JSON array of changed standards files
+#   snapshot                      SHA of a dangling commit of the working tree
+#                                 (untracked included, .dod/ excluded) — round
+#                                 2+ review's delta_to
 #   result-write --requirements <json>
+#                                 also records a snapshot as the result's
+#                                 snapshot_sha (the next round's delta_from) and
+#                                 fills the review's reconfirm file/line/summary
+#                                 from the prior round (result_enrich_reconfirm)
 #   record-decisions <json>       record fix/skip per advisory id, then claim
 #   claim                         arm the claim latch (dod-claim.sh)
 #
@@ -48,7 +57,7 @@ usage() {
 usage: dod.sh <verb> [args]
 verbs: brief-path | contract-write <flags…> | contract-read | state-set <idle|verifying>
        diff-hash | cache-get <cmd> | cache-set <cmd> <pass|fail> | baseline-worktree
-       changed-standards | result-write --requirements <json>
+       changed-standards | snapshot | result-write --requirements <json>
        record-decisions <json> | claim
 EOF
   exit 2
@@ -60,7 +69,7 @@ VERB="${1:-}"
 [ $# -gt 0 ] && shift
 case "$VERB" in
   brief-path|contract-write|contract-read|state-set|diff-hash|cache-get|cache-set|\
-  baseline-worktree|changed-standards|result-write|record-decisions|claim) : ;;
+  baseline-worktree|changed-standards|snapshot|result-write|record-decisions|claim) : ;;
   *) usage ;;
 esac
 
@@ -105,8 +114,11 @@ cmd_contract_write() {
 }
 
 # cmd_contract_read — what the skills need, built from the libs' read vars.
+# result.snapshot_sha is "" (never null) for a legacy result without one.
+# next_review is never null: {mode:"full", reconfirm:[], delta_from:""} when
+# there is no result to continue from.
 cmd_contract_read() {
-  local result="null"
+  local result="null" next_review
   load_contract
   state_read "$STATE_FILE"
   if result_read "$RESULT_FILE"; then
@@ -114,12 +126,15 @@ cmd_contract_read() {
       --arg diff_hash "$RESULT_DIFF_HASH" \
       --arg baseline_sha "$RESULT_BASELINE_SHA" \
       --arg round "$RESULT_ROUND" \
+      --arg snapshot_sha "$RESULT_SNAPSHOT_SHA" \
       --argjson requirements "$RESULT_REQUIREMENTS" \
       --argjson advisory_ids "$RESULT_ADVISORY_IDS" \
       --argjson creep_ids "$RESULT_CREEP_IDS" \
       '{diff_hash: $diff_hash, baseline_sha: $baseline_sha, round: ($round | tonumber? // 0),
-        requirements: $requirements, advisory_ids: $advisory_ids, creep_ids: $creep_ids}')
+        snapshot_sha: $snapshot_sha, requirements: $requirements, advisory_ids: $advisory_ids, creep_ids: $creep_ids}')
   fi
+  next_review=$(result_next_review "$RESULT_FILE" "$CONTRACT_BASELINE_SHA")
+  [ -n "$next_review" ] || die "could not compute the next review's inputs from $RESULT_FILE"
   jq -n \
     --arg repo "$REPO" \
     --arg task_key "$CONTRACT_TASK_KEY" \
@@ -136,12 +151,13 @@ cmd_contract_read() {
     --argjson decisions "$STATE_DECISIONS" \
     --arg decided_diff_hash "$STATE_DECIDED_DIFF_HASH" \
     --argjson result "$result" \
+    --argjson next_review "$next_review" \
     '{repo: $repo, task_key: $task_key, status: $status, task: $task,
       task_source: $task_source, session_id: $session_id, works_when: $works_when,
       baseline_sha: $baseline_sha, requirements: $requirements, waivers: $waivers,
       brief: $brief,
       state: {state: $state, decisions: $decisions, decided_diff_hash: $decided_diff_hash},
-      result: $result}'
+      result: $result, next_review: $next_review}'
 }
 
 # current_hash — the diff hash against the contract baseline (never HEAD),
@@ -169,13 +185,20 @@ cmd_cache_set() {
 
 cmd_result_write() {
   [ "${1:-}" = "--requirements" ] || die "usage: dod.sh result-write --requirements <json>"
-  local requirements="${2:?usage: dod.sh result-write --requirements <json>}" round
+  local requirements="${2:?usage: dod.sh result-write --requirements <json>}" round snapshot
   current_hash
   round=$(result_next_round "$RESULT_FILE" "$CONTRACT_BASELINE_SHA")
+  # Before result_write overwrites the prior result it enriches from.
+  requirements=$(result_enrich_reconfirm "$RESULT_FILE" "$CONTRACT_BASELINE_SHA" "$requirements")
+  # Fail open: without a snapshot the result is still valid; the next round
+  # just reviews in full instead of the delta.
+  snapshot=$(dod_snapshot "$REPO") \
+    || printf 'dod: warning: could not snapshot the working tree — next review round will be full\n' >&2
   result_write "$RESULT_FILE" \
     --diff-hash "$DIFF_HASH" \
     --baseline-sha "$CONTRACT_BASELINE_SHA" \
     --round "$round" \
+    --snapshot-sha "$snapshot" \
     --requirements "$requirements" \
     || die "result rejected (requirements must be a JSON array of check/judgement entries, every finding with an id) — nothing written"
   printf 'dod: result written at %s (round %s, diff_hash %s)\n' "$RESULT_FILE" "$round" "$DIFF_HASH"
@@ -216,6 +239,7 @@ case "$VERB" in
     load_contract
     dod_changed_standards "$REPO" "$CONTRACT_BASELINE_SHA" || die "could not list changed standards"
     ;;
+  snapshot) dod_snapshot "$REPO" || die "could not snapshot the working tree of $REPO" ;;
   result-write) cmd_result_write "$@" ;;
   record-decisions) cmd_record_decisions "$@" ;;
   claim) cmd_claim ;;

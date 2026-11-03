@@ -52,8 +52,11 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    It prints one JSON object: the contract (`status`, `task`,
    `works_when`, `baseline_sha`, `requirements`, `waivers`, `brief`, …),
    `state` (`state`, `decisions`, `decided_diff_hash`) and `result` — the
-   latest `result.json` (`diff_hash`, `round`, `requirements`,
-   `advisory_ids`, `creep_ids`), or `null` if none. Below, "the contract's
+   latest `result.json` (`diff_hash`, `round`, `snapshot_sha`,
+   `requirements`, `advisory_ids`, `creep_ids`), or `null` if none — and
+   `next_review` (`mode`, `reconfirm`, `delta_from`: step 5's inputs).
+   `snapshot_sha` is the commit of the working tree that round verified
+   (`""` on a result written before it existed). Below, "the contract's
    X" means field X of this output; re-run it whenever you need a value
    again, never carry one in a shell variable.
    If it exits non-zero (no contract), or `status` is not `"open"`, tell the
@@ -168,11 +171,11 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    - `depth` — `scope` if the contract's `waivers` has an entry with
      `id: "review"` (the user consented to a scope-only review), else `full`.
 
-   **Round 1** (no prior `result.json`, or the prior result's round is being
-   superseded by fresh work — i.e. this is the first verify pass for the
-   current diff_hash lineage — or the prior result's `review` findings
-   contain a blocking `lens:"scope"`, `kind:"creep"` finding, i.e. that review
-   stopped at the scope lens and lenses 2-6 never ran): spawn in `full` mode.
+   **Which round** — read contract-read's `next_review` and use its `mode`,
+   `reconfirm` and `delta_from` verbatim; never derive them yourself (the
+   CLI computes them, D15/D16).
+
+   **`mode: "full"`**: spawn with
    ```
    baseline_sha : <the contract's baseline_sha>
    mode         : full
@@ -184,17 +187,21 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    depth        : full | scope
    ```
 
-   **Round 2+** (a prior `result.json` exists for this task with `blocking`
-   findings from the `review` requirement, none of them a `lens:"scope"`,
-   `kind:"creep"` finding — i.e. the agent already ran `/dod:verify` once,
-   got a `fail` verdict on `review` from a review that ran every lens, fixed
-   something, and is verifying again): spawn in `delta_reconfirm` mode,
-   passing the prior round's blocking findings back as `reconfirm`:
+   **`mode: "delta_reconfirm"`**: take a snapshot of the working tree now:
+   ```bash
+   bash "${CLAUDE_PLUGIN_ROOT}/scripts/dod.sh" snapshot
+   ```
+   It prints a commit SHA; that is `delta_to`. If `next_review.delta_from`
+   is `""` or `snapshot` exits non-zero, leave out the `delta_from` and
+   `delta_to` lines but still spawn in `delta_reconfirm` mode with
+   `reconfirm` — the reviewer then runs every lens over the full changeset
+   and still re-checks each `reconfirm` entry (D16).
    ```
    baseline_sha : <the contract's baseline_sha>
    mode         : delta_reconfirm
-   delta_from   : <prior result's diff_hash (contract-read's result.diff_hash)>
-   reconfirm    : <prior round's review findings with severity "blocking", except lens "scope">
+   delta_from   : <next_review.delta_from>
+   delta_to     : <the SHA `snapshot` just printed>
+   reconfirm    : <next_review.reconfirm>
    task         : <the contract's task>
    works_when   : <the contract's works_when>
    requirements : <the contract's requirements>
@@ -202,11 +209,6 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    changed_standards : <changed-standards output>
    depth        : full | scope
    ```
-   Leave `lens: "scope"` findings out of `reconfirm` — the scope check
-   re-runs over the full changeset every round and re-raises any that still
-   hold. After a creep stop — whether the user chose revert or accept &
-   amend — the next round is always Round 1 (`full`), so the original
-   changeset gets every lens and an impact trace.
 
    **After the user's advisory decision** (contract-read's `state.decisions` is
    non-empty, see "Advisory decision" below): add
@@ -218,17 +220,20 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    schema in `dod/agents/dod-reviewer.md`). Parse it — do not paraphrase or
    re-summarize it yourself, pass the `findings` array, `depth` and
    `impact_trace` through to step 6 as-is, every finding with its `lens`
-   (and a scope finding's `kind`). The requirement's own
+   (and a scope finding's `kind`). In `delta_reconfirm` mode pass its
+   `reconfirm` array on too, as-is.
+   The requirement's own
    `verdict` in `result.json` is the reviewer's `verdict` field: `"fail"` if
    any finding has `severity: "blocking"` or any `reconfirm` entry has
    `status != "fixed"`, else `"pass"`.
 
 6. **Write the result, then mark verification done.** Via the CLI, which
    delegates to `dod/lib/result.sh`'s `result_write` — do not construct or
-   edit `result.json` any other way (N6). The CLI computes the diff hash and
-   the round (`result_next_round`) itself and takes the baseline from the
-   contract; you pass only the requirements' verdicts, written out as
-   literal JSON in one single-quoted argument:
+   edit `result.json` any other way (N6). The CLI computes the diff hash,
+   the round (`result_next_round`) and the `snapshot_sha` (the next round's
+   `delta_from`) itself and takes the baseline from the contract; you pass
+   only the requirements' verdicts, written out as literal JSON in one
+   single-quoted argument:
 
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/scripts/dod.sh" result-write --requirements '<requirements JSON array>'
@@ -241,7 +246,7 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    [
      {"id":"tests","type":"check","verdict":"pass|fail","cmd":"...","exit":N},
      {"id":"lint","type":"check","verdict":"waived","cmd":"...","reason":"user: prototype spike"},
-     {"id":"review","type":"judgement","verdict":"pass|fail","depth":"<reviewer depth>","findings":[<reviewer findings>],"impact_trace":[<reviewer impact_trace>]},
+     {"id":"review","type":"judgement","verdict":"pass|fail","depth":"<reviewer depth>","findings":[<reviewer findings>],"impact_trace":[<reviewer impact_trace>],"reconfirm":[<step 5 reconfirm — delta_reconfirm only>]},
      {"id":"docs","type":"check","verdict":"pass|fail|n/a","doc_paths":[...]}
    ]
    ```
@@ -250,8 +255,10 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    `kind` (the gate reads `lens:"scope"` + `kind:"creep"` to stop instead of
    asking for a fix). Its `depth` and `impact_trace` are the
    reviewer's `depth` string and `impact_trace` array, also unchanged
-   (`impact_trace` is `[]` after a creep stop or at depth `scope`) — the
-   `review` entry records them as `docs/design-v2.md` §6.4 documents;
+   (`impact_trace` is `[]` after a creep stop or at depth `scope`). In
+   `delta_reconfirm` mode the entry also carries the reviewer's `reconfirm`
+   array as-is — the CLI fills each entry's `file`/`line`/`summary`; in
+   `full` mode leave the field out. The `review` entry records them as `docs/design-v2.md` §6.4 documents;
    `result_write` stores extra fields as given.
    Clear `state` back to `"idle"` right after — leaving it `"verifying"`
    only means a possible future turn gets a slightly misleading "wait,
@@ -300,7 +307,9 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
      `check` with a `baseline_verdict`, state it plainly ("pre-existing —
      also fails at baseline" vs "new — passes at baseline, this changeset
      broke it"); for `review`, every `blocking` finding's file, line, and
-     summary. Then delegate the fixes — a `kind:"gap"` finding is a normal
+     summary, and every `reconfirm` entry not `fixed` (its file, line,
+     summary and status, from the `review` entry of the result contract-read
+     now prints — the CLI filled in file/line/summary). Then delegate the fixes — a `kind:"gap"` finding is a normal
      fix: the implementer completes the missing part of the task. Every fix
      delegation passes the context brief's path (when applicable) and tells
      the implementer to read it before editing. Do not list advisories or raise them as decisions: a failing

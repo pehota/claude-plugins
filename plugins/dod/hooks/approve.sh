@@ -37,7 +37,7 @@ ROOT_P="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)"
 [ -n "$ROOT" ] || exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 
-VERBS="brief-path contract-write contract-read state-set diff-hash cache-get cache-set baseline-worktree changed-standards result-write record-decisions claim"
+VERBS="brief-path contract-write contract-read state-set diff-hash cache-get cache-set baseline-worktree changed-standards snapshot result-write record-decisions claim"
 
 # The args grammar, anchored with \A/\z (never ^/$: in jq's regex flavour $
 # also matches before a trailing newline). Alternatives start on disjoint

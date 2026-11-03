@@ -313,6 +313,55 @@ eq "changed_standards: .dod/ excluded" "false" \
 eq "changed_standards: lint config excluded" "false" \
   "$(printf '%s' "$CS_ALL" | jq -e 'any(.[]; . == ".eslintrc.json")' >/dev/null 2>&1 && echo true || echo false)"
 
+# --- dod_snapshot -------------------------------------------------------------
+# Guards the delta_reconfirm bug: /dod:verify used to hand the reviewer the
+# prior diff_hash (a content fingerprint, not a commit) as delta_from, so
+# `git diff <delta_from>` could never resolve and every round 2+ silently
+# became a full review. A snapshot is a real commit of the working tree.
+REPO9=$(dod__test_make_repo)
+echo base > "$REPO9/a.txt"
+git -C "$REPO9" add a.txt && git -C "$REPO9" commit -q -m a
+echo staged > "$REPO9/staged.txt"; git -C "$REPO9" add staged.txt
+CACHED_BEFORE=$(git -C "$REPO9" diff --cached --name-only)
+S1=$(dod_snapshot "$REPO9")
+eq "snapshot: prints a commit" "commit" "$(git -C "$REPO9" cat-file -t "$S1" 2>/dev/null)"
+eq "snapshot: parent is HEAD" "$(git -C "$REPO9" rev-parse HEAD)" "$(git -C "$REPO9" rev-parse "$S1^" 2>/dev/null)"
+echo edited > "$REPO9/a.txt"
+echo new > "$REPO9/new.txt"
+mkdir -p "$REPO9/.dod/main" "$REPO9/sub/.dod"
+echo '{}' > "$REPO9/.dod/main/result.json"
+echo nested > "$REPO9/sub/.dod/x"
+# a .dod/ not covered by .gitignore must still be excluded (never rely on it)
+printf '' > "$REPO9/.gitignore"
+git -C "$REPO9" config core.excludesFile /dev/null  # nor on a global ignore
+S2=$(dod_snapshot "$REPO9")
+eq "snapshot: delta = edited tracked + new untracked (.gitignore edit aside)" \
+  ".gitignore a.txt new.txt" "$(git -C "$REPO9" diff --name-only "$S1" "$S2" 2>/dev/null | tr '\n' ' ' | sed 's/ $//')"
+eq "snapshot: edited content captured" "edited" "$(git -C "$REPO9" show "$S2:a.txt" 2>/dev/null)"
+eq "snapshot: .dod/ excluded (top-level and nested)" "" \
+  "$(git -C "$REPO9" ls-tree -r --name-only "$S2" 2>/dev/null | grep '\.dod/')"
+eq "snapshot: real index untouched" "$CACHED_BEFORE" "$(git -C "$REPO9" diff --cached --name-only)"
+eq "snapshot: worktree status unchanged (new.txt still untracked)" "?? new.txt" \
+  "$(git -C "$REPO9" status --porcelain -- new.txt)"
+eq "snapshot: no ref created" "" "$(git -C "$REPO9" for-each-ref --contains "$S2" 2>/dev/null)"
+
+# works from a subdir, normalised to the top-level
+S3=$(dod_snapshot "$REPO9/sub")
+eq "snapshot: from a subdir -> a commit" "commit" "$(git -C "$REPO9" cat-file -t "$S3" 2>/dev/null)"
+eq "snapshot: from a subdir -> same tree" "$(git -C "$REPO9" rev-parse "$S2^{tree}")" "$(git -C "$REPO9" rev-parse "$S3^{tree}" 2>/dev/null)"
+
+# works without any git identity configured
+REPO10=$(dod__test_make_repo)
+git -C "$REPO10" config --unset user.email; git -C "$REPO10" config --unset user.name
+S4=$(HOME="$REPO10" XDG_CONFIG_HOME="$REPO10" GIT_CONFIG_NOSYSTEM=1 dod_snapshot "$REPO10")
+eq "snapshot: works without user.name/email" "commit" "$(git -C "$REPO10" cat-file -t "$S4" 2>/dev/null)"
+
+# failure is clean: non-zero, nothing printed
+NOGIT9=$(dod__test_mktemp_d); CLEANUP_DIRS="$CLEANUP_DIRS $NOGIT9"
+OUT9=$(dod_snapshot "$NOGIT9"); RC9=$?
+[ "$RC9" -ne 0 ] && ok "snapshot: outside a repo -> non-zero" || bad "snapshot: outside a repo -> non-zero" "$RC9"
+eq "snapshot: outside a repo -> prints nothing" "" "$OUT9"
+
 echo
 echo "gitref.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

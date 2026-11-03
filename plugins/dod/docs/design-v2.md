@@ -127,7 +127,7 @@ flowchart TB
       CONTRACTLIB["contract.sh · schema+read+write"]
       RESULTLIB["result.sh · schema+read+write"]
       STATELIB["state.sh · schema+read+write"]
-      GITREF["gitref.sh · branch_key · diff_hash · worktree"]
+      GITREF["gitref.sh · branch_key · diff_hash · snapshot · worktree"]
       IO["io.sh · fail_open · block · release · templates"]
     end
     subgraph SKILLS["Skills — run by the agent · unbounded · judgement allowed"]
@@ -410,14 +410,24 @@ run without a permission prompt.
   ├─ judgement orchestr. ─ spawn dod-reviewer with fixed prompt + schema, incl.
   │                        `brief`, `changed_standards` (dod_changed_standards)
   │                        and `depth` (`scope` from a `review` waiver, else
-  │                        `full`); round 1: full changeset; round 2: delta +
-  │                        re-confirm round-1 blocking findings (scope
+  │                        `full`); mode/reconfirm/delta_from computed by
+  │                        result_next_review (code, not skill text);
+  │                        round 1: full changeset; round 2+ (prior
+  │                        review failed, no creep stop): delta + re-confirm
+  │                        every prior blocking finding not yet reported
+  │                        fixed — prior blocking findings + prior reconfirm
+  │                        entries not `fixed`, deduped by id (scope
   │                        findings excluded — the scope lens re-runs fresh);
-  │                        after a creep stop the next round is full again
+  │                        delta = `git diff <prior snapshot_sha> <snapshot
+  │                        now>` (no prior snapshot → lenses over the full
+  │                        changeset, reconfirm kept); after a creep
+  │                        stop the next round is full again
   ├─ finding classifier ── blocking vs advisory; a blocking `scope`+`creep`
   │                        finding is a user decision (revert / accept &
   │                        amend), never an auto-fix (ADR 0004)
   ├─ result_write ──────── via lib/result.sh · evidence/ files · keyed to diff_hash
+  │                        · records snapshot_sha (dod_snapshot) · fills
+  │                        reconfirm file/line/summary (result_enrich_reconfirm)
   └─ pass table printer ── on all-pass, prints the brief table to the user
 ```
 
@@ -425,12 +435,21 @@ run without a permission prompt.
 hash differently, the gate would reject every result. One function, one file.
 
 **Mechanics (ADR 0005).** Each component is one `dod.sh` call:
-`contract-read` (contract + state + latest result as JSON — the round 1 vs
-round 2 decision and `delta_from` read its `result`), `state-set
+`contract-read` (contract + state + latest result as JSON, plus
+`next_review: {mode, reconfirm, delta_from}` — the round 1 vs round 2
+decision, the next `reconfirm` and the prior `snapshot_sha`, computed by
+`result_next_review` in `lib/result.sh`; the skill passes them verbatim and
+derives nothing), `state-set
 verifying|idle`, `cache-get`/`cache-set <cmd>` (diff hash computed
 internally, against the contract baseline), `baseline-worktree`,
-`changed-standards`, `result-write --requirements '<json>'` (diff hash and
-`result_next_round` computed internally, baseline from the contract),
+`changed-standards`, `snapshot` (the round 2+ `delta_to`: a dangling commit
+of the working tree, untracked files included, `.dod/` excluded, built on a
+temporary index so the real one is never touched), `result-write
+--requirements '<json>'` (diff hash, `result_next_round` and `snapshot_sha`
+computed internally, baseline from the contract; before overwriting the
+prior result, `result_enrich_reconfirm` fills each `review.reconfirm`
+entry's missing `file`/`line`/`summary` from the prior round's
+`next_review.reconfirm` item of the same `id`),
 `claim`, and `record-decisions '<json>'` (records the advisory decision,
 then re-arms the latch). The reviewer's findings go into `result-write`'s
 JSON verbatim.
@@ -453,7 +472,7 @@ dod/
 │   ├── contract.sh     ▸ SCHEMA + contract_read/write/validate   ← owns contract.json
 │   ├── result.sh       ▸ SCHEMA + result_read/write/validate     ← owns result.json
 │   ├── state.sh        ▸ SCHEMA + state_read/write + mutators    ← owns state.json
-│   ├── gitref.sh       branch_key · diff_hash · baseline worktree
+│   ├── gitref.sh       branch_key · diff_hash · snapshot · baseline worktree
 │   └── io.sh           fail_open · block · release · template render
 ├── scripts/
 │   ├── dod.sh          the skills' one-line CLI → lib/*.sh (ADR 0005)
@@ -616,6 +635,8 @@ Owned by `lib/result.sh`.
   "diff_hash": "9f8e…",                    // the gate's trust key
   "baseline_sha": "a1b2c3",
   "round": 1,
+  "snapshot_sha": "c3d4e5…",               // dod_snapshot of the verified tree;
+                                           // next round's delta_from ("" if none)
   "requirements": [
     { "id": "tests", "type": "check", "verdict": "fail",
       "cmd": "pnpm test", "exit": 1,
@@ -637,6 +658,11 @@ Owned by `lib/result.sh`.
         { "file": "src/a.ts", "line": 42,
           "guarantees": ["transaction opened by saveOrder()"], "inside": false }
       ],
+      "reconfirm": [                        // delta_reconfirm rounds only
+        { "id": "f0", "file": "src/c.ts", "line": 7,
+          "summary": "unescaped input", "status": "still_present",
+          "evidence": "src/c.ts:7 unchanged" }
+      ],
       "evidence": "evidence/review-r1.json" }
   ],
   "summary": { "pass": 3, "blocking_fail": 2, "advisory": 1, "waived": 1, "na": 1 }
@@ -648,7 +674,13 @@ standards | security | correctness`); a `scope` finding also carries `kind`
 (`creep | gap`). `impact_trace` is one entry per changed hunk the impact lens
 walked, `[]` when it did not run (a creep stop, or `depth: scope`). `depth`
 records whether the round ran `full` or `scope`. `/dod:verify` copies both
-onto the `review` entry verbatim from the reviewer's output. `result_read` exports
+onto the `review` entry verbatim from the reviewer's output. In a
+`delta_reconfirm` round the entry also keeps the reviewer's `reconfirm`
+(`id`, `status`, `evidence` verbatim, as `/dod:verify` passes them;
+`file`/`line`/`summary` filled in by code — `result_enrich_reconfirm`, from
+the prior result's `result_next_review` item of that `id`): a still-present
+blocker outside the delta is never re-raised in `findings`, so this is where
+it survives to the next round (D16). `result_read` exports
 `RESULT_CREEP_IDS`: the ids of `blocking` findings with `lens:"scope"` and
 `kind:"creep"` — `gate.sh`'s one-shot creep branch (§5.1, 8a) reads it to
 route scope creep to a user decision instead of an ordinary fix round.
@@ -660,7 +692,8 @@ findings are raised to the user, never silently fixed and never silently
 dropped. The threshold is hardcoded in v1; see §9.
 
 **Only the final review's advisories count.** Each round's `findings[]` is
-that round's reviewer output as-is; nothing carries across rounds. A failing
+that round's reviewer output as-is; no finding carries across rounds (only
+unfixed blockers do, via `reconfirm`, §6.7). A failing
 round's advisories are ignored (except on escalation, §6.6); the passing
 round's are the ones the user decides on (§6.5). `result_read` exposes their
 ids as `RESULT_ADVISORY_IDS`. `round` is the prior result's `round + 1` for the same `baseline_sha`, else 1
@@ -829,7 +862,8 @@ UNRESOLVED
 ```
 baseline_sha   : a1b2c3
 mode           : full | delta_reconfirm
-delta_from     : <round-1 diff hash>            (delta mode only)
+delta_from     : <prior result's snapshot_sha>  (delta mode only)
+delta_to       : <`dod.sh snapshot` output>    (delta mode only)
 reconfirm      : [ { id, file, line, summary } ] (delta mode only)
 task           : <contract.task>
 works_when     : <contract.works_when>
@@ -847,8 +881,18 @@ depth          : full | scope                                      (ADR 0004)
   requirement's `proves` genuinely proves `works_when`.
 - Classify every finding `blocking` or `advisory`. `blocking` = bug, security
   hole, broken behaviour, spec violation. Everything else is `advisory`.
-- In `delta_reconfirm` mode: review the delta **and** separately re-check each
-  `reconfirm` entry against current code.
+- In `delta_reconfirm` mode: review the delta — `git diff <delta_from>
+  <delta_to>`, two snapshot commits of the whole working tree — **and**
+  separately re-check each `reconfirm` entry against current code. Lenses
+  2-6 report only on hunks inside the delta — a leftover outside it was
+  judged in the prior round and comes back via `reconfirm`. Unchanged code
+  that a delta hunk breaks (e.g. a consumer of output the hunk changed) is
+  reported on that causing hunk, not as a leftover. A missing or
+  unresolvable `delta_from`/`delta_to` (a prior round without a snapshot)
+  means lenses 2-6 run over the full changeset, never a guessed range, while
+  `reconfirm` is still re-checked (D16).
+- New finding ids never reuse an id already in `reconfirm[]` — later rounds
+  key on it.
 - Do not fix anything. Do not write outside your result.
 
 **Lenses — in order** (ADR 0004): `scope` → `impact` → `spec` → `standards` →
@@ -862,7 +906,11 @@ next, over every changed hunk, so it is never the lens cut on a large diff —
 it walks each hunk's callers and enclosing scope, names the guarantees in
 force (transaction, lock, auth context, ordering), and records
 `{file, line, guarantees, inside}` in `impact_trace` for every hunk, escape or
-not. `spec` judges `works_when`/`task` conformance and the `docs`
+not. A hunk that changes observable output (stdout format, file format, exit
+codes, JSON shape) also gets its consumers searched repo-wide — pipes,
+`$(...)`, readers of a written file, not only code callers; each consumer's
+expectation is a guarantee, and one the hunk breaks is a `blocking` `impact`
+finding anchored to the hunk, naming the consumer. `spec` judges `works_when`/`task` conformance and the `docs`
 requirement's `doc_paths`, same as before. `standards` reads `brief` as a
 **floor, not a ceiling** — check against it, then form an independent view;
 if `brief` is `n/a`, fall back to the reviewer's own standards discovery. A
@@ -895,6 +943,17 @@ disagree.
 
 `reconfirm.status != "fixed"` counts as a blocking failure. "I fixed it" is
 never accepted as the evidence that it was fixed.
+
+**Which round, and what `reconfirm` holds** — computed by code:
+`result_next_review` (`lib/result.sh`), exposed as contract-read's
+`next_review`, which `/dod:verify` step 5 passes verbatim. Round 2+
+(`delta_reconfirm`) when the prior result belongs to this contract (same
+`baseline_sha`), its `review` verdict is `fail`, and it has no creep stop
+(`creep_ids` empty); else round 1 (`full`). Keying on the verdict, not on
+blocking `findings`, covers a review that failed through `reconfirm` alone.
+Round 2+ `reconfirm` = the prior `review`'s blocking non-scope `findings` +
+its `reconfirm` entries whose `status` is not `fixed`, deduped by `id`. A
+blocker drops out only once a reviewer reports it `fixed`.
 
 ---
 
@@ -1037,8 +1096,8 @@ blocking-only review, then closes. The decision is asked once per contract.
 | D12 | **Revised — no `guard.sh`.** The agent self-invokes `/dod:define` before its first edit, the moment a task is clear — same status as D28's self-triggered `/dod:verify`, the primary path, not a fallback. The human running it explicitly, and `track.sh`'s nudge (D9), are the fallback for when the agent doesn't self-invoke — responsibility passes to the human only once the agent has already failed to act. Superseded the original "PreToolUse guard denies edits" wording after two live tests (2026-09-17, scratch repo `dod-e2e-test`) showed self-initiation can go wrong — one session opened the contract late, a second never opened it at all despite the nudge firing three times. A `PreToolUse` guard was considered again at that point and rejected on a simpler ground than the first pass (which only found the original wording unenforceable, per D2): the fix for an agent not doing its job is the same pattern already used for `/dod:verify` — expect it, fall back to the human — not a hard lock on `Edit`/`Write` that blocks every unrelated edit with no escape hatch | rely on skill step ordering with no D28-style explicit self-invoke instruction (original v1); unconditional PreToolUse deny on all edits until a contract exists (considered, rejected — no escape hatch, over-blocks doc/scratch edits); a signal-based guard requiring D2's deferred auto-detection first (considered, rejected — same false-positive risk D2 already ruled out); making `/dod:define` human-only with no agent self-invoke path (considered, rejected — inconsistent with D28's proven pattern and removes a working path rather than fixing the failure case). Later exception (§4): a trivial non-behavioural change may skip `/dod:define` only on the user's explicit yes to the agent's one-line proposal |
 | D13 | Auto-detected battery + task-derived requirements | fixed list; derived only |
 | D14 | e2e applicability decided at definition time, with a recorded reason | decided at verify time; reviewer-confirmed exemption |
-| D15 | Round 2 re-runs all checks, delta-scopes judgements | full re-review; failed-only |
-| D16 | Round 2 also re-confirms every round-1 blocking finding | delta only |
+| D15 | Round 2+ re-runs all checks, delta-scopes judgements — the delta is the diff between two `dod_snapshot` commits (prior result's `snapshot_sha` → now); a legacy result without one gets every lens over the full changeset, `reconfirm` still re-checked; the mode and `delta_from` are computed by code (`result_next_review` → contract-read's `next_review`), never by the skill model | full re-review; failed-only; delta from the prior `diff_hash` (a content fingerprint no `git diff` can resolve — every round 2 silently became a full review) |
+| D16 | Every round 2+ re-confirms every prior blocking finding until a reviewer reports it `fixed` — `reconfirm` is the prior blocking non-scope findings plus the prior `reconfirm` entries not `fixed`, persisted on the `review` entry with `file`/`line`/`summary` filled by `result_enrich_reconfirm`; round 2+ is keyed on the prior review's `fail` verdict (no creep stop), so a review failing through `reconfirm` alone still continues; the list and the round choice are computed by code (`result_next_review`), not skill text the model follows | delta only; re-confirm only the previous round's `findings` (a still-present blocker outside the delta dropped out after one round) |
 | D17 | Infrastructure errors fail open; verification failures fail closed | fail closed throughout; fail open throughout |
 | D18 | Pre-existing failures resolved lazily in a persistent worktree | full battery at open; `git stash`; ignore |
 | D19 | Cache on `(diff_hash, cmd)` | no caching |

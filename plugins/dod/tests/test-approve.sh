@@ -50,7 +50,7 @@ allows "double-quoted root"            "bash \"$CLI\" contract-read"
 allows "single-quoted root"            "bash '$CLI' contract-read"
 allows "bare root"                     "bash $CLI contract-read"
 for verb in brief-path contract-write contract-read state-set diff-hash cache-get cache-set \
-            baseline-worktree changed-standards result-write record-decisions claim; do
+            baseline-worktree changed-standards snapshot result-write record-decisions claim; do
   allows "verb $verb" "bash \"$CLI\" $verb"
 done
 allows "plain args"                    "bash \"$CLI\" state-set verifying"

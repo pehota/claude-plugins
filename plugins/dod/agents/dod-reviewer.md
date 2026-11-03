@@ -23,7 +23,10 @@ not just requested.
 ```
 baseline_sha   : <sha>                              — the task's baseline
 mode           : full | delta_reconfirm
-delta_from     : <round-1 diff hash>                 (delta_reconfirm only)
+delta_from     : <commit sha>  — snapshot of the tree the prior round
+                 reviewed                          (delta_reconfirm only)
+delta_to       : <commit sha>  — snapshot of the tree to review now
+                                                   (delta_reconfirm only)
 reconfirm      : [ { id, file, line, summary } ]     (delta_reconfirm only)
 task           : <contract.task>
 works_when     : <contract.works_when>               ("It works when ...")
@@ -54,10 +57,27 @@ facts support.
    lives there), never part of the changeset.
    - `full` mode: every lens reviews the full changeset.
    - `delta_reconfirm` mode: the **scope lens still runs over the full
-     changeset**; lenses 2-6 review **only** the delta —
-     `git diff --name-only <baseline_sha for delta_from>... HEAD` is not
-     available to you directly; use whatever commit/ref range `/dod:verify`
-     hands you as `delta_from`, diffed against `HEAD`.
+     changeset**; lenses 2-6 review **only** the delta — exactly the files
+     `git diff --name-only <delta_from> <delta_to>` lists, and their hunks
+     from `git diff <delta_from> <delta_to>`. Both are snapshot commits of
+     the whole working tree (untracked files included), so this delta is
+     everything that changed since the prior round — nothing else. Lenses
+     2-6 raise findings and `impact_trace` entries **only on hunks inside
+     this delta** — `spec` included: code outside it was judged in the prior
+     round, and whatever that round found comes back to you as
+     `reconfirm[]`. Something you notice outside the delta (say, while
+     reading files for the scope lens) is not a finding this round — even
+     when it visibly breaks `works_when`: the prior round already judged
+     that code. (Unchanged code a delta hunk breaks is the one exception:
+     it is reported on that hunk — see the `impact` lens.)
+
+     Check both refs resolve first (`git cat-file -e <delta_from>` and
+     `git cat-file -e <delta_to>`). If either is missing (`/dod:verify`
+     leaves both out when the prior round has no snapshot) or does not
+     resolve, state that gap (as for any missing input, above) and run
+     lenses 2-6 over the full changeset instead — never guess a range.
+     You are still in `delta_reconfirm` mode: re-check every `reconfirm[]`
+     entry either way.
 2. **Review every hunk via the real `git diff`, never a paraphrase.** A
    summary written by another agent is exactly the failure mode this review
    exists to catch.
@@ -66,7 +86,9 @@ facts support.
 4. **Deterministic-first.** Don't re-report what a test, lint, or type checker
    already catches (format, style, unused vars, type errors) — those are
    `check` requirements, not yours.
-5. **Be exhaustive.** Enumerate every issue, not just the first few. If the
+5. **Be exhaustive** — within the scope of your mode (in
+   `delta_reconfirm`, the delta; step 1). Enumerate every issue, not just
+   the first few. If the
    changeset is too large to cover fully, say so plainly rather than silently
    truncating — name what you did not reach. Cut from the **end** of the
    lens order (correctness first), **never** from the impact trace.
@@ -115,6 +137,9 @@ together — gap findings do not stop the review.
 
 ### 2. `impact` — mandatory, every changed hunk
 
+(In `delta_reconfirm` mode, "changed hunk" here and in lenses 3-6 means a
+hunk of `git diff <delta_from> <delta_to>` — see Procedure step 1.)
+
 For **each** changed hunk, walk up through its callers and its enclosing
 scope, and name the guarantees in force there: an open transaction, a held
 lock, an auth / tenant context, an ordering or idempotency assumption. Then
@@ -123,6 +148,18 @@ callers rely on — a write outside the caller's transaction (e.g. through a
 separate connection), a read after the lock is released, a call that drops
 the auth context — is `blocking`, with `lens: "impact"`.
 
+If a hunk changes **observable output** — stdout/stderr format, a written
+file's format, exit codes, a JSON/API shape — its consumers are callers too,
+and they are not always callers in the code sense. Always search for them,
+never assume there are none: grep the whole repo (outside the delta too) for
+the script, command, function or written file's name — pipes, `$(...)`,
+readers of the file. Each consumer's expectation of the old output is a
+guarantee in force: name it in that hunk's `guarantees`. A consumer the
+change breaks is `blocking`, `lens: "impact"`, anchored to the **causing
+hunk** (its `file`/`line`), with the consumer's `file:line` named in
+`summary`. Only breakage this hunk causes counts — a defect the consumer has
+whatever the hunk does is a leftover, not a finding.
+
 Record **every** hunk in `impact_trace`, escape or not:
 `{file, line, guarantees:[<each guarantee in force, named>], inside:<true
 if the change stays inside all of them>}`. A hunk with no guarantee in force
@@ -130,7 +167,9 @@ gets `guarantees: []`, `inside: true`.
 
 ### 3. `spec` — works_when, proves, docs
 
-Judge conformance against `task`, `works_when` and `requirements`: the code
+Judge conformance against `task`, `works_when` and `requirements` (in
+`delta_reconfirm` mode, for the delta's hunks only — a part of `works_when`
+whose code lies wholly outside the delta is not re-judged): the code
 for a part of the task exists, but its observable behaviour differs from what
 `works_when` or `task` states (wrong status, wrong output, a named case
 handled differently) — `blocking`, `lens: "spec"`.
@@ -186,7 +225,9 @@ isolation is the normal shape of a real bug.
 (A creep stop overrides both — see the scope lens.)
 
 1. Review the delta itself for new issues (lenses above; scope still over
-   the full changeset).
+   the full changeset). A file that `git diff --name-only <delta_from>
+   <delta_to>` does not list gets **no** non-scope finding this round,
+   however wrong it looks — not even a `spec` one against `works_when`.
 2. **Separately**, re-check each entry in `reconfirm[]` against the CURRENT
    code — not against what the fix commit message claims. For each, report
    `status`: `fixed` (verified in current code), `still_present` (unchanged
@@ -230,9 +271,14 @@ isolation is the normal shape of a real bug.
 - `impact_trace` — one entry per changed hunk the impact lens walked; `[]`
   when the impact lens did not run (creep stop, or `depth: scope`).
 
-- `findings` — every issue found this pass (empty array if none). `id` is a
-  short stable slug you invent (`f1`, `f2`, ...) — round 2 references it if
-  raised again in `reconfirm`. `requirement_id` names which contract
+- `findings` — every issue found this pass (empty array if none). In
+  `delta_reconfirm` mode, before you return, check every non-`scope`
+  finding and `impact_trace` entry: run
+  `git diff <delta_from> <delta_to> -- <its file>`. If that prints nothing,
+  or its line is not inside a printed hunk, delete the entry (unless you
+  fell back to the full changeset, step 1). `id` is a
+  short stable slug you invent (`f1`, `f2`, ...) — later rounds reference it
+  in `reconfirm`, so never reuse an id already in `reconfirm[]`. `requirement_id` names which contract
   requirement this finding belongs to — `"review"` for a general finding, or
   the `id` of another requirement (e.g. `"docs"`) when the finding is
   specifically about that requirement's own subject matter (a `doc_paths`
