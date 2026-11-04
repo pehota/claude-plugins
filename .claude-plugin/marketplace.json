@@ -1,6 +1,6 @@
 {
   "$schema": "https://code.claude.com/schemas/marketplace.json",
-  "name": "claude-plugins",
+  "name": "pehota-plugins",
   "description": "A curated collection of Claude Code plugins",
   "owner": {
     "name": "Dimitar Apostolov",
@@ -9,5 +9,11 @@
   "metadata": {
     "pluginRoot": "./plugins"
   },
-  "plugins": []
+  "plugins": [
+    {
+      "name": "media-writer",
+      "source": "media-writer",
+      "description": "First-person technical articles and X posts that share one set of truth, anonymity, voice and style rules."
+    }
+  ]
 }
