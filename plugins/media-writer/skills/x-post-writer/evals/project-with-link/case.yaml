@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: project-with-link
+expected_outcome: |
+  Exactly three drafts labelled Problem-Solver, Visual Teaser and Unpopular Opinion,
+  each ending with a specific open-ended question and then a "replies" teaser as the
+  last line. The URL appears only in a separate Reply block, never in a main post.
+  No hashtags, no emojis other than the single teaser emoji, no marketing speak,
+  no invented facts. No filler text before or after.

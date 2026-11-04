@@ -1,0 +1,8 @@
+schema_version: "1.1"
+name: project-with-screenshot
+expected_outcome: |
+  Exactly three drafts labelled Problem-Solver, Visual Teaser and Unpopular Opinion.
+  The Visual Teaser copy explicitly points at the attached dashboard screenshot.
+  There is no link, so no replies teaser and no Reply block. Each draft ends with a
+  specific open-ended question. No hashtags, no emojis, no marketing speak, no
+  invented numbers. No filler text before or after.

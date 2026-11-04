@@ -1,0 +1,9 @@
+{
+  "name": "media-writer",
+  "description": "Skills for writing as a builder: first-person technical articles and X posts that share one set of truth, anonymity, voice and style rules.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Dimitar Apostolov"
+  },
+  "license": "MIT"
+}

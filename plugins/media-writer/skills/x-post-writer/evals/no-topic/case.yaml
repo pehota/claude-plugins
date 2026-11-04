@@ -1,0 +1,5 @@
+schema_version: "1.1"
+name: no-topic
+expected_outcome: |
+  The skill asks for the topic, whether there is a link, and whether there is a
+  visual. It asks nothing else and writes no drafts.
