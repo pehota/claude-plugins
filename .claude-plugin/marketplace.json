@@ -14,6 +14,11 @@
       "name": "media-writer",
       "source": "media-writer",
       "description": "First-person technical articles and X posts that share one set of truth, anonymity, voice and style rules."
+    },
+    {
+      "name": "dod",
+      "source": "dod",
+      "description": "Task-DoD lifecycle: an explicit dod-collect skill records a per-task Definition-of-Done contract before implementation, then blocks Stop until that contract has a passing verification result."
     }
   ]
 }
