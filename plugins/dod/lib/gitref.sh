@@ -1,0 +1,289 @@
+#!/bin/bash
+#
+# dod/lib/gitref.sh — git-derived identity: task key, diff hash, ancestry,
+# changed-standards detection (ADR 0004).
+#
+# No `set -e`/`set -u`/pipefail (sourced into hooks). Every git call guarded;
+# callers get empty string / non-zero on failure, never a crash.
+#
+# Sanitisation happens ONCE here, inside dod_task_key, unlike v1
+# (harness-common.sh) which re-sanitised at three call sites.
+
+GITREF_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+dod__has_jq() { command -v jq >/dev/null 2>&1; }
+
+# dod__sanitize <str> — every char not in [A-Za-z0-9_.-] becomes '-'.
+dod__sanitize() {
+  printf '%s' "$1" | LC_ALL=C sed 's/[^A-Za-z0-9_.-]/-/g' 2>/dev/null
+}
+
+# dod_task_key <repo_dir> — sanitised current branch name. Empty on failure
+# (detached HEAD, non-git dir).
+dod_task_key() {
+  local repo="$1" branch=""
+  branch=$(git -C "$repo" symbolic-ref -q --short HEAD 2>/dev/null)
+  [ -n "$branch" ] || return 1
+  dod__sanitize "$branch"
+}
+
+# dod_repo_root <dir> — the git top-level containing dir, or dir itself when
+# it is not inside a git repo (never empty, never a crash). The single
+# anchor for everything dod keys on a repo: .dod/ lives at the top-level and
+# every repo-relative path is top-level-relative, whichever subdir a hook or
+# skill was launched from. Without it, `git diff --name-only` (top-level-
+# relative) and `git ls-files --others` (cwd-relative) disagree from a
+# subdir and hash-object reads the wrong path (see dod_diff_hash).
+dod_repo_root() {
+  local top
+  top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)
+  if [ -n "$top" ]; then printf '%s' "$top"; else printf '%s' "$1"; fi
+}
+
+# gitref__changed_paths <repo_dir> <baseline_sha> — repo-relative paths
+# changed since baseline: `git diff --name-only` (tracked, vs baseline)
+# unioned with untracked paths (git ls-files --others --exclude-standard),
+# deduped, .dod/ excluded (see dod_diff_hash's header for why .dod/ must
+# never be trusted). Shared enumeration for dod_diff_hash (content-hashing on
+# top) and dod_changed_standards (pattern-filtering on top) — DRY, since both
+# need the same "which paths changed since baseline" answer.
+gitref__changed_paths() {
+  local repo baseline="$2"
+  repo=$(dod_repo_root "$1")
+  {
+    git -C "$repo" diff --name-only "$baseline" -- 2>/dev/null
+    git -C "$repo" ls-files --others --exclude-standard 2>/dev/null
+  } | sort -u | while IFS= read -r f; do
+    case "$f" in .dod/*|*/.dod/*) continue ;; esac
+    printf '%s\n' "$f"
+  done
+}
+
+# dod_diff_hash <repo_dir> <baseline_sha> — stable hash of "which paths
+# changed since baseline, and their current blob content". Identical
+# working-tree content -> identical hash, regardless of how many times it's
+# been committed; any touched/added/deleted path (relative to baseline, plus
+# untracked) -> different hash.
+#
+# MUST diff against the task's baseline SHA, never HEAD, and MUST NOT emit
+# `git diff`'s own patch text. Two failure modes were found the hard way:
+#
+#   1. `git diff HEAD` is distance-from-HEAD, not a content fingerprint —
+#      committing moves HEAD to match the working tree, so a HEAD-relative
+#      diff collapses to empty even though nothing in the working tree
+#      changed. Fixed by diffing against the fixed baseline instead (a
+#      commit with no net tree change then can't move the hash).
+#
+#   2. Even diffed against a fixed baseline, patch text is NOT
+#      commit-invariant: before a commit, a newly-added file is untracked and
+#      gets dumped once by the untracked-files loop; after committing it, the
+#      same file is now tracked and ALSO appears in `git diff <baseline>` as
+#      a new-file patch — same logical content, different bytes fed to
+#      hash-object (patch-file framing vs a raw dump), so the hash still
+#      moved. Fixed by hashing (path, current blob content) pairs instead of
+#      patch text: the path list is diff --name-only (tracked, vs baseline)
+#      unioned with untracked paths, and each path contributes its OWN
+#      current bytes via `git hash-object` — content-addressed and identical
+#      whether that path is currently tracked or untracked.
+#
+# A path present in the diff but missing from the working tree (deleted since
+# baseline) hashes to the literal marker "MISSING" rather than being silently
+# skipped — a delete must move the hash same as any other change.
+#
+# Paths are top-level-relative, so repo is normalised to the git top-level
+# first (dod_repo_root) — called from a subdir, "$repo/$f" would otherwise
+# double the subdir prefix and hash every file as MISSING, leaving a hash
+# blind to content.
+#
+# Excludes .dod/ (and any nested */.dod/) defensively even though it belongs in .gitignore: result.json
+# and state.json are themselves written as untracked files under .dod/, so
+# without this exclusion every dod_diff_hash call after a result_write would
+# hash its own output, self-invalidating the very result it just wrote. Never
+# rely on .gitignore alone for this — a repo that hasn't picked up the ignore
+# rule yet must not wedge the gate.
+dod_diff_hash() {
+  local repo baseline="$2"
+  [ -n "$baseline" ] || return 1
+  repo=$(dod_repo_root "$1")
+  {
+    gitref__changed_paths "$repo" "$baseline" | while IFS= read -r f; do
+      printf '%s\n' "$f"
+      git -C "$repo" hash-object "$repo/$f" 2>/dev/null || printf 'MISSING\n'
+    done
+  } | git hash-object --stdin 2>/dev/null
+}
+
+# dod_snapshot <repo_dir> — prints the SHA of a commit whose tree is the
+# current working tree: tracked changes plus untracked non-ignored files,
+# .dod/ excluded at any depth (same enumeration rule as
+# gitref__changed_paths). Parent = HEAD. Non-zero and prints nothing on
+# failure.
+#
+# Why a commit, not dod_diff_hash: the diff hash is a content fingerprint no
+# `git diff` can resolve. /dod:verify stores a snapshot per round (result.json
+# snapshot_sha) so round 2+ can hand dod-reviewer two real commits and it
+# reviews exactly `git diff <prior snapshot> <current snapshot>`.
+#
+# Never touches the caller's index or working tree: everything runs against a
+# temporary GIT_INDEX_FILE, seeded from a copy of the real index (its stat
+# cache spares re-hashing every unchanged file; `add -A` then makes it match
+# the working tree anyway), or from HEAD when there is no index yet; any
+# .dod/ entry the seed carried (staged, or tracked at HEAD) is dropped, so a
+# snapshot tree never holds .dod/ at all. A fixed
+# identity, set via env, works in repos with no user.name/email; signing is
+# off so a commit.gpgSign config cannot prompt or fail.
+#
+# ponytail: the commit is left dangling (no ref). Unreachable objects can be
+# pruned by `git gc` after its grace period (2 weeks by default); a prior
+# snapshot that no longer resolves just degrades the next review to full
+# mode. If that ever bites, keep a ref under refs/dod/ per task.
+dod_snapshot() {
+  local repo tmp idx real_idx head tree sha
+  [ -n "$1" ] || return 1
+  repo=$(dod_repo_root "$1")
+  head=$(git -C "$repo" rev-parse -q --verify HEAD 2>/dev/null) || return 1
+  tmp=$(mktemp -d 2>/dev/null) || return 1
+  [ -n "$tmp" ] || return 1
+  idx="$tmp/index"
+  real_idx=$(git -C "$repo" rev-parse --git-path index 2>/dev/null)
+  case "$real_idx" in ''|/*) ;; *) real_idx="$repo/$real_idx" ;; esac
+  if [ -n "$real_idx" ] && [ -f "$real_idx" ]; then
+    cp "$real_idx" "$idx" 2>/dev/null
+  else
+    GIT_INDEX_FILE="$idx" git -C "$repo" read-tree "$head" >/dev/null 2>&1
+  fi
+  if [ -f "$idx" ] \
+    && GIT_INDEX_FILE="$idx" git -C "$repo" add -A -- . ':(exclude,glob)**/.dod/**' >/dev/null 2>&1 \
+    && GIT_INDEX_FILE="$idx" git -C "$repo" rm -r -q --cached --ignore-unmatch -- ':(glob)**/.dod/**' >/dev/null 2>&1; then
+    tree=$(GIT_INDEX_FILE="$idx" git -C "$repo" write-tree 2>/dev/null)
+  fi
+  rm -rf "$tmp" 2>/dev/null
+  [ -n "$tree" ] || return 1
+  sha=$(GIT_AUTHOR_NAME=dod GIT_AUTHOR_EMAIL=dod@localhost \
+        GIT_COMMITTER_NAME=dod GIT_COMMITTER_EMAIL=dod@localhost \
+        git -C "$repo" commit-tree --no-gpg-sign -p "$head" -m "dod snapshot" "$tree" 2>/dev/null)
+  [ -n "$sha" ] || return 1
+  printf '%s\n' "$sha"
+}
+
+# dod_changed_standards <repo_dir> <baseline_sha> — JSON array of
+# repo-relative paths changed since baseline (committed, staged, unstaged,
+# untracked; .dod/ excluded, same enumeration as dod_diff_hash) that name a
+# project-standards file: `CLAUDE.md`, `AGENTS.md`, `CONTEXT.md` at any
+# depth, `docs/adr/*`, `.claude/rules/*`, `.cursor/rules/*`, or
+# `.github/copilot-instructions.md`.
+#
+# ADR 0004: /dod:verify uses this to tell a standards edit the task actually
+# asked for from unrequested scope creep. Empty input -> `[]`, never a bare
+# empty string, so callers can always `jq` the result without checking for
+# that case first.
+dod_changed_standards() {
+  local repo="$1" baseline="$2" f base
+  [ -n "$baseline" ] || return 1
+  dod__has_jq || return 1
+  {
+    gitref__changed_paths "$repo" "$baseline" | while IFS= read -r f; do
+      base="${f##*/}"
+      case "$base" in
+        CLAUDE.md|AGENTS.md|CONTEXT.md) printf '%s\n' "$f"; continue ;;
+      esac
+      case "$f" in
+        docs/adr/*|.claude/rules/*|.cursor/rules/*|.github/copilot-instructions.md)
+          printf '%s\n' "$f" ;;
+      esac
+    done
+  } | jq -R -s -c 'split("\n") | map(select(length > 0))'
+}
+
+# dod_is_ancestor <repo_dir> <ancestor_sha> <descendant_sha> — 0 if ancestor
+# is reachable from descendant, 1 otherwise (including unknown SHAs, and any
+# other git-call failure — see dod_is_ancestor_status if the caller needs to
+# tell those apart).
+dod_is_ancestor() {
+  local repo="$1" anc="$2" desc="$3"
+  [ -n "$anc" ] && [ -n "$desc" ] || return 1
+  git -C "$repo" merge-base --is-ancestor "$anc" "$desc" 2>/dev/null
+}
+
+# dod_is_ancestor_status <repo_dir> <ancestor_sha> <descendant_sha> — prints
+# git's raw `merge-base --is-ancestor` exit code (0, 1, or, on failure —
+# unresolvable SHA, a shallow clone missing the needed history, a transient
+# git I/O error — typically 128) and returns it too. Callers that must not
+# conflate "confirmed not an ancestor" (exactly 1) with "the git call itself
+# failed" (anything else non-zero) use this instead of dod_is_ancestor's
+# collapsed boolean — see gate.sh branch 4, which must fail-open on the
+# latter rather than silently expiring a perfectly good contract.
+dod_is_ancestor_status() {
+  local repo="$1" anc="$2" desc="$3"
+  if [ -z "$anc" ] || [ -z "$desc" ]; then
+    printf '1'
+    return 1
+  fi
+  git -C "$repo" merge-base --is-ancestor "$anc" "$desc" 2>/dev/null
+  local code=$?
+  printf '%s' "$code"
+  return "$code"
+}
+
+# dod_baseline_worktree <repo_dir> <task_key> <baseline_sha> — ensures a
+# worktree checked out at baseline_sha exists at
+# <top-level>/.dod/<task_key>/baseline-worktree (repo normalised via
+# dod_repo_root), creating it only if missing or stale
+# (§5.3, D18: "resolved lazily in a persistent worktree"). Prints the
+# worktree's absolute path on success, prints nothing and returns 1 on
+# failure. Idempotent and cheap to call every time a caller needs it — the
+# expensive `git worktree add` only actually runs once per task.
+#
+# Lazy and persistent, not eager-per-check, because most checks pass on the
+# first try and never need their baseline verdict at all — building the
+# worktree unconditionally at /dod:define time would pay a full checkout's
+# cost on every task, including ones with zero pre-existing failures.
+# Persistent (not torn down after one lookup) because a single verify round
+# commonly re-checks several failing requirements' baselines, and repeated
+# `git worktree add`/`remove` churn would be pure waste against the same sha.
+#
+# Never touches the caller's working tree or index — worktrees are isolated
+# checkouts sharing the same .git, so recompiled artefacts or lockfile state
+# in the main tree are unaffected by this.
+dod_baseline_worktree() {
+  local repo="$1" task_key="$2" baseline_sha="$3" wt
+  [ -n "$repo" ] && [ -n "$task_key" ] && [ -n "$baseline_sha" ] || return 1
+  repo=$(dod_repo_root "$repo")
+  wt="$repo/.dod/$task_key/baseline-worktree"
+
+  if [ -d "$wt/.git" ] || [ -f "$wt/.git" ]; then
+    local wt_sha
+    wt_sha=$(git -C "$wt" rev-parse -q --verify HEAD 2>/dev/null)
+    if [ "$wt_sha" = "$baseline_sha" ]; then
+      printf '%s' "$wt"
+      return 0
+    fi
+    # stale (task amended to a new baseline) -> rebuild it at the new sha.
+    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+    rm -rf "$wt" 2>/dev/null
+  fi
+
+  mkdir -p "$(dirname "$wt")" 2>/dev/null
+  git -C "$repo" worktree add --detach --force "$wt" "$baseline_sha" >/dev/null 2>&1 || return 1
+  printf '%s' "$wt"
+  return 0
+}
+
+# dod_baseline_worktree_remove <repo_dir> <task_key> — tears down the
+# worktree `dod_baseline_worktree` created, if any. Called from gate.sh on
+# every terminal-status transition — branch 10 (all pass) alongside
+# status:=passed, per §5.1/§6.2's branch-10 row, AND branch 6 (escalation)
+# alongside status:=escalated. Both are terminal: once status != "open",
+# branch 3 releases every subsequent Stop before branch 6/10 run again, so a
+# worktree not torn down here would never be torn down at all. Safe to call
+# when no worktree exists.
+dod_baseline_worktree_remove() {
+  local repo="$1" task_key="$2" wt
+  [ -n "$repo" ] && [ -n "$task_key" ] || return 1
+  repo=$(dod_repo_root "$repo")
+  wt="$repo/.dod/$task_key/baseline-worktree"
+  [ -d "$wt" ] || return 0
+  git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1
+  rm -rf "$wt" 2>/dev/null
+  return 0
+}

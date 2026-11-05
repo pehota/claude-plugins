@@ -1,0 +1,360 @@
+#!/bin/bash
+#
+# dod/hooks/gate.sh — the Stop decision tree.
+#
+# Exit contract (block is a JSON stdout object, not `exit 2` — exit 2 renders
+# in the transcript as a hook *error*, which is wrong for a deliberate gate
+# decision; harness errors keep exit 1 so the two stay visibly distinct):
+#   stdout {"decision":"block","reason":"…"} + exit 0  -> block
+#   silent + exit 0                                    -> release (normal)
+#   stderr one line + exit 1                            -> release (harness error)
+#
+# No `set -e`, no `set -u`, no pipefail — every git/jq call guarded
+# individually so a harness bug degrades to fail-open (branch 0), never a
+# wedged session.
+#
+# Branches shipped: 0,1,2,3,4,5,6,7,8,8a,9,10,11,12. Branch 8a (ADR 0004,
+# scope creep) sits between the "no-result" checks and branch 8's ordinary
+# round-bump path: a blocking finding with lens:"scope" kind:"creep" blocks
+# once (no round bump, contract stays open) and then releases every later
+# Stop on that SAME result via state.creep_diff_hash, until a new result.json
+# exists. A gap finding (lens:"scope" kind:"gap") is not creep and still
+# takes branch 8 exactly as before. Branch 5 detects both "claimed"
+# (latch armed) and "edited this prompt_id without a latch" via state.edits
+# (track.sh); the latch only counts for the session that armed it, so a
+# killed/crashed session's claim no longer gates a later session that makes
+# no edits. Branch 4 (expiry) only covers a rebased/force-pushed baseline:
+# an orphaned contract with untouched history stays "open" (no TTL /
+# liveness check) — it just stops blocking other sessions, and edits in a
+# later session still claim it.
+#
+# D26: round budget = 2. An identical diff_hash across two failing rounds
+# (no progress) burns the budget immediately, same as reaching round 2 —
+# see gate__no_progress below.
+DOD_ROUND_BUDGET="${DOD_ROUND_BUDGET:-2}"
+
+PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
+PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+
+DOD_ERR=""
+for lib in io.sh gitref.sh contract.sh result.sh state.sh; do
+  if [ -f "$PLUGIN_ROOT/lib/$lib" ]; then
+    . "$PLUGIN_ROOT/lib/$lib" 2>/dev/null
+  else
+    DOD_ERR="missing lib: $lib"
+  fi
+done
+
+# Key .dod/ on the git top-level, whichever subdir the session was launched
+# from — the skills resolve the same root (dod_repo_root "$PWD"), so both
+# sides read and write ONE <root>/.dod. Guarded: if gitref.sh failed to load,
+# PROJECT_DIR stays as given and the fail-open path below handles it.
+command -v dod_repo_root >/dev/null 2>&1 && PROJECT_DIR=$(dod_repo_root "$PROJECT_DIR")
+
+ERRLOG="$PROJECT_DIR/.dod/errors.log"
+
+# --- branch 0: harness error (missing lib / no jq / no git) -----------------
+if [ -n "$DOD_ERR" ]; then
+  # dod_fail_open may itself be unavailable if io.sh failed to load.
+  if command -v dod_fail_open >/dev/null 2>&1; then
+    dod_fail_open "$ERRLOG" "$DOD_ERR"
+  else
+    printf 'dod gate error: %s\n' "$DOD_ERR" >&2
+  fi
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1; then
+  dod_fail_open "$ERRLOG" "jq not found"
+  exit 1
+fi
+if ! command -v git >/dev/null 2>&1; then
+  dod_fail_open "$ERRLOG" "git not found"
+  exit 1
+fi
+
+dod_hook_read
+SESSION_ID="$DOD_HOOK_SESSION_ID"
+[ -n "$SESSION_ID" ] || SESSION_ID="unknown-session"
+STOP_HOOK_ACTIVE="$DOD_HOOK_STOP_ACTIVE"
+PROMPT_ID="$DOD_HOOK_PROMPT_ID"
+
+# --- non-git / detached HEAD / mid-rebase -> release, silent -----------------
+GIT_DIR=$(git -C "$PROJECT_DIR" rev-parse --git-dir 2>/dev/null)
+if [ -z "$GIT_DIR" ]; then
+  dod_release
+  exit 0
+fi
+case "$GIT_DIR" in /*) : ;; *) GIT_DIR="$PROJECT_DIR/$GIT_DIR" ;; esac
+if [ -f "$GIT_DIR/MERGE_HEAD" ] || [ -d "$GIT_DIR/rebase-apply" ] || [ -d "$GIT_DIR/rebase-merge" ]; then
+  dod_release
+  exit 0
+fi
+HEAD_SHA=$(git -C "$PROJECT_DIR" rev-parse -q --verify HEAD 2>/dev/null)
+if [ -z "$HEAD_SHA" ]; then
+  dod_release
+  exit 0
+fi
+if ! git -C "$PROJECT_DIR" symbolic-ref -q HEAD >/dev/null 2>&1; then
+  dod_release
+  exit 0
+fi
+
+TASK_KEY=$(dod_task_key "$PROJECT_DIR")
+[ -n "$TASK_KEY" ] || TASK_KEY="session-${SESSION_ID}"
+
+DOD_DIR="$PROJECT_DIR/.dod/$TASK_KEY"
+CONTRACT_FILE="$DOD_DIR/contract.json"
+RESULT_FILE="$DOD_DIR/result.json"
+STATE_FILE="$DOD_DIR/state.json"
+LAST_BLOCK_FILE="$DOD_DIR/last-block"
+
+# block <category> <reason> — A2: category-scoped recursion brake. Releases
+# under stop_hook_active only if this category equals the last one recorded;
+# a DIFFERENT category still blocks even under stop_hook_active.
+gate__block() {
+  local category="$1" reason="$2" prev=""
+  [ -f "$LAST_BLOCK_FILE" ] && prev=$(cat "$LAST_BLOCK_FILE" 2>/dev/null | tr -d '\r\n')
+  if [ "$STOP_HOOK_ACTIVE" = "true" ] && [ "$category" = "$prev" ]; then
+    dod_release
+    exit 0
+  fi
+  mkdir -p "$DOD_DIR" 2>/dev/null
+  printf '%s\n' "$category" > "$LAST_BLOCK_FILE" 2>/dev/null
+  dod_block "$reason"
+  exit 0
+}
+
+gate__clear_last_block() { rm -f "$LAST_BLOCK_FILE" 2>/dev/null; }
+
+# --- branch 2: no contract -> release, silent --------------------------------
+if [ ! -f "$CONTRACT_FILE" ]; then
+  gate__clear_last_block
+  dod_release
+  exit 0
+fi
+
+contract_read "$CONTRACT_FILE" || {
+  dod_fail_open "$ERRLOG" "contract.json unreadable at $CONTRACT_FILE"
+  exit 1
+}
+
+# --- branch 3: status != open -> release, silent -----------------------------
+if [ "$CONTRACT_STATUS" != "open" ]; then
+  gate__clear_last_block
+  dod_release
+  exit 0
+fi
+
+# --- branch 4: baseline SHA no longer an ancestor of HEAD -> expire ----------
+# A rebase, force-push, or history rewrite can move HEAD such that the
+# recorded baseline is no longer reachable from it — the diff hash's "vs
+# baseline" comparison (dod_diff_hash) would then be comparing against a
+# commit outside the branch's own history, which is meaningless. Expire
+# rather than silently keep gating: `expired` releases via branch 3 on every
+# later turn, same as `passed`/`cancelled`, and does not resurrect itself.
+# Does NOT expire a killed/crashed session's contract with untouched
+# history — that baseline is still a perfectly good ancestor, just orphaned
+# by the missing SessionEnd. The contract stays "open" (no TTL / liveness
+# check); branch 5's session-scoped latch is what keeps it from blocking a
+# later session that makes no edits.
+#
+# `git merge-base --is-ancestor` has three outcomes, not two: exit 0 (is an
+# ancestor), exit 1 (confirmed NOT an ancestor — a real answer), and anything
+# else, typically 128 (the call itself failed: unresolvable SHA, a shallow
+# clone missing the needed history, a transient git I/O error). Only exit 1
+# means "expire" — any other failure must fail-open (branch 0's machinery)
+# rather than silently flipping a perfectly good open contract to a terminal
+# status with no error logged anywhere.
+dod_is_ancestor_status "$PROJECT_DIR" "$CONTRACT_BASELINE_SHA" "$HEAD_SHA" >/dev/null
+ANCESTOR_STATUS=$?
+if [ "$ANCESTOR_STATUS" -eq 1 ]; then
+  contract_set_status "$CONTRACT_FILE" "expired"
+  dod_baseline_worktree_remove "$PROJECT_DIR" "$TASK_KEY"
+  gate__clear_last_block
+  dod_release
+  exit 0
+elif [ "$ANCESTOR_STATUS" -ne 0 ]; then
+  dod_fail_open "$ERRLOG" "dod_is_ancestor_status failed (exit $ANCESTOR_STATUS) for baseline $CONTRACT_BASELINE_SHA vs HEAD $HEAD_SHA"
+  exit 1
+fi
+
+# --- branch 5: claimed OR edited this prompt (D8) -----------------------------
+# Latch alone under-blocks (an agent that edits then stops without running
+# /dod:verify would silently skip the gate); "edits since open" over-blocks
+# (a question-only turn on an already-open contract would wrongly gate). The
+# per-prompt_id edit log from track.sh is the middle ground.
+#
+# The latch is session-scoped: dod-claim.sh records the claiming session,
+# and a latch armed by a DIFFERENT session than this Stop's is ignored — a
+# claim must not outlive its session and block a later one that made no
+# edits (Oct 1 orphan). Either id empty (older host, or a latch armed before
+# scoping existed) -> the latch claims as before, never under-blocking.
+state_read "$STATE_FILE"
+LATCHED="$STATE_LATCHED"
+[ "$LATCHED" = "true" ] || LATCHED="false"
+if [ "$LATCHED" = "true" ] && [ -n "$STATE_LATCHED_SESSION_ID" ] \
+  && [ -n "$DOD_HOOK_SESSION_ID" ] && [ "$STATE_LATCHED_SESSION_ID" != "$DOD_HOOK_SESSION_ID" ]; then
+  LATCHED="false"
+fi
+
+CLAIMED="$LATCHED"
+if [ "$CLAIMED" != "true" ] && [ -n "$PROMPT_ID" ]; then
+  state_has_edit_for_prompt "$STATE_FILE" "$PROMPT_ID" && CLAIMED="true"
+fi
+
+if [ "$CLAIMED" != "true" ]; then
+  gate__clear_last_block
+  dod_release
+  exit 0
+fi
+
+# --- branch 6: escalation already armed -> release, mark escalated (D21) ----
+# Two-step escalation: branch 9 (below) blocks ONCE with the report and arms
+# state.escalation; this branch is what the NEXT Stop sees. It releases
+# silently rather than blocking again — the report was already delivered,
+# the agent has already been told to stop trying and report to the user, so
+# re-blocking here would just resume the loop the escalation was meant to
+# end. contract.status flips to "escalated" so branch 3 (status != open)
+# keeps this task released on every subsequent turn without re-checking
+# escalation each time.
+if [ "$STATE_ESCALATION" = "armed" ]; then
+  contract_set_status "$CONTRACT_FILE" "escalated"
+  dod_baseline_worktree_remove "$PROJECT_DIR" "$TASK_KEY"
+  gate__clear_last_block
+  dod_release
+  exit 0
+fi
+
+# --- branch 1: stop_hook_active loop guard (category-scoped via gate__block) -
+# (No unconditional release here — A2 requires checking the category, which
+# only gate__block can do once it knows which branch we're about to hit.)
+
+DIFF_HASH=$(dod_diff_hash "$PROJECT_DIR" "$CONTRACT_BASELINE_SHA")
+
+# --- branch 7: no result, or result stale (diff_hash mismatch) -> block ------
+# state.state (wording-only, see state.sh header) distinguishes "verify never
+# started" from "verify is running, e.g. waiting on a backgrounded
+# dod-reviewer" — the main loop's turn can end (triggering Stop) while a
+# spawned reviewer is still in flight, and telling the agent to "run
+# /dod:verify" when it already did is misleading, not just repetitive.
+# The same applies to a stale result left over from a previous round.
+VERIFYING_MSG="verification is already running (waiting on the independent reviewer) — wait for it to finish, write the result, then stop again. Do not re-run /dod:verify from scratch."
+if [ ! -f "$RESULT_FILE" ]; then
+  if [ "$STATE_STATE" = "verifying" ]; then
+    gate__block "no-result" "$VERIFYING_MSG"
+  else
+    gate__block "no-result" "task DoD present but no verification result exists for this changeset — run /dod:verify, then stop again."
+  fi
+fi
+
+result_read "$RESULT_FILE" || {
+  gate__block "no-result" "verification result is malformed or unreadable — run /dod:verify, then stop again."
+}
+
+if [ "$RESULT_DIFF_HASH" != "$DIFF_HASH" ]; then
+  if [ "$STATE_STATE" = "verifying" ]; then
+    gate__block "no-result" "$VERIFYING_MSG"
+  fi
+  gate__block "no-result" "verification result does not match the current changeset — run /dod:verify, then stop again."
+fi
+
+# --- branch 8/10: result matches diff -> check for blocking failures --------
+case "$RESULT_BLOCKING_FAIL" in
+  ''|*[!0-9]*)
+    gate__block "no-result" "verification result is malformed (bad blocking-fail count) — run /dod:verify, then stop again."
+    ;;
+esac
+
+if [ "$RESULT_BLOCKING_FAIL" -gt 0 ]; then
+  # --- branch 8a: scope creep (ADR 0004) -> block once, no round bump -------
+  # A blocking review finding with lens:"scope" kind:"creep" is a decision
+  # for the USER (revert the creep, or accept it and amend the contract),
+  # never something the agent auto-fixes — so it must not enter the ordinary
+  # round-bump/escalation machinery (that's for the agent to keep trying).
+  # One-shot: block the first Stop that sees this result, then release every
+  # later Stop on the SAME result (state.creep_diff_hash == this diff_hash)
+  # silently, contract left "open", until a genuinely NEW result.json
+  # (different diff_hash) exists — i.e. until /dod:verify runs again on a
+  # changed changeset. Gap findings (lens:"scope" kind:"gap") are NOT creep
+  # and fall through unchanged to branch 8 below.
+  if [ "$RESULT_CREEP_IDS" != "[]" ]; then
+    if [ "$STATE_CREEP_DIFF_HASH" = "$DIFF_HASH" ]; then
+      gate__clear_last_block
+      dod_release
+      exit 0
+    fi
+    state_set_creep_diff_hash "$STATE_FILE" "$DIFF_HASH"
+    gate__block "creep" "verification found scope-creep finding(s) outside the task's agreed scope (ids: ${RESULT_CREEP_IDS}) — report them to the user and ask: revert the creep, or accept it and amend the contract. Do not fix it yourself. Stop here."
+  fi
+
+  # D26: identical diff_hash across two failing rounds means no progress was
+  # made since the last failure — burn the budget immediately rather than
+  # waiting for round to literally reach the cap, so a stuck agent that
+  # re-runs /dod:verify without changing anything doesn't get a free extra
+  # round out of it.
+  NO_PROGRESS="false"
+  [ -n "$STATE_LAST_FAILED_DIFF_HASH" ] && [ "$STATE_LAST_FAILED_DIFF_HASH" = "$DIFF_HASH" ] && NO_PROGRESS="true"
+
+  state_bump_round "$STATE_FILE"
+  state_set_last_failed_diff_hash "$STATE_FILE" "$DIFF_HASH"
+
+  NEW_ROUND=$((STATE_ROUND + 1))
+  case "$STATE_ROUND" in ''|*[!0-9]*) NEW_ROUND=1 ;; esac
+
+  if [ "$NEW_ROUND" -ge "$DOD_ROUND_BUDGET" ] || [ "$NO_PROGRESS" = "true" ]; then
+    # --- branch 9: budget exhausted (or no progress) -> block once, escalate
+    # Headline names the actual trigger — "no progress" can fire on round 1
+    # (e.g. budget raised above 2 later) without the round count having
+    # reached DOD_ROUND_BUDGET, so "BUDGET EXHAUSTED" would misdescribe it.
+    if [ "$NO_PROGRESS" = "true" ]; then
+      ESCALATE_HEADLINE="DOD GATE — NO PROGRESS after ${NEW_ROUND} round(s)."
+      ESCALATE_REASON="no progress: diff unchanged between rounds"
+    else
+      ESCALATE_HEADLINE="DOD GATE — BUDGET EXHAUSTED after ${NEW_ROUND} round(s)."
+      ESCALATE_REASON="verification still failing"
+    fi
+    state_set_escalation "$STATE_FILE" "armed"
+    gate__block "escalate" "${ESCALATE_HEADLINE} ${ESCALATE_REASON}. Report the unresolved findings and the advisories of the last review to the user, then stop. Do not attempt another fix."
+  fi
+
+  # Disarm the latch here: this round's claim has been fully judged (failed)
+  # and the contract stays open for another round, unlike branch 9/10 where
+  # contract.status leaves "open" and branch 3 shields every later turn
+  # regardless of the latch. Without this, the latch (armed once by
+  # /dod:verify and otherwise never cleared) stays true forever, so the
+  # NEXT Stop — even a question-only turn with zero edits — reads
+  # CLAIMED=true at branch 5, skips it, and re-hits this same stale result
+  # (issue #33 / N1 violation). A real re-run of /dod:verify re-arms the
+  # latch itself (its step 7), so this never under-blocks a genuine retry.
+  state_disarm_latch "$STATE_FILE"
+  gate__block "findings" "verification result for this changeset has ${RESULT_BLOCKING_FAIL} failing requirement(s) — fix them, run /dod:verify, then stop again."
+fi
+
+# --- branch 11: all pass, advisories, no decision yet -> await, release -----
+# The agent has shown the user one fix/skip table and is waiting on the
+# reply, not on unfinished work: release, but keep the contract open. The
+# latch stays armed so the Stop after the reply (decision recorded, no
+# edits) re-enters here and closes; until then every Stop re-lands here and
+# releases again.
+if [ "$STATE_DECISIONS" = "[]" ] && [ "$RESULT_ADVISORY_IDS" != "[]" ]; then
+  gate__clear_last_block
+  dod_release
+  exit 0
+fi
+
+# --- branch 12: a fix was decided, changeset unchanged since -> block ------
+# A skip-all decision closes below; a `fix` needs the fix and a fresh
+# /dod:verify first. Any advisory that later round raises is not a new
+# decision — decisions exist, so branch 11 never fires again, and nothing
+# compares their ids to a later result's.
+if state_decision_needs_verify "$STATE_FILE" "$DIFF_HASH"; then
+  gate__block "decision" "the user chose to fix advisory finding(s), but the changeset has not changed since that decision — fix them, run /dod:verify, then stop again."
+fi
+
+# --- branch 10: all pass -> release, mark passed -----------------------------
+contract_set_status "$CONTRACT_FILE" "passed"
+dod_baseline_worktree_remove "$PROJECT_DIR" "$TASK_KEY"
+gate__clear_last_block
+dod_release
+exit 0

@@ -1,0 +1,297 @@
+#!/bin/bash
+#
+# dod/lib/state.sh — sole owner of state.json (N6).
+#
+# Nothing outside this file may `jq` into state.json. Holds the claim latch,
+# round counter and escalation flag the gate's decision tree reads and
+# (only it) mutates.
+#
+# Fields: latched, latched_session_id (below), round, escalation, last_failed_diff_hash, creep_diff_hash
+# (ADR 0004, below), edits[] (track.sh), state ("idle"|"verifying", this
+# file), cache{} (this file), decisions[] / decided_diff_hash (the user's
+# fix/skip decision on the final review's advisory findings, below) and
+# errors_unacknowledged (session.sh's error banner).
+#
+# `state` is WORDING-ONLY: gate.sh reads it to pick which block message to
+# print, never to change the block/release decision itself (that stays
+# governed by result.json's existence and diff-hash match, unchanged). No
+# TTL/staleness guard — a crashed session can leave it stuck "verifying",
+# but the only cost is a misleading-but-harmless "wait, it's running"
+# message for at most one turn; the next /dod:verify call resets it fresh
+# regardless of what it was. Deliberately not over-engineered (YAGNI).
+
+STATE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+dod__has_jq() { command -v jq >/dev/null 2>&1; }
+
+# state__locked <path> <body...> — runs body (a full read-modify-write) under
+# an exclusive flock on "<path>.lock", so two concurrent writers (e.g. a
+# subagent and the main loop each editing files, each firing their own
+# track.sh) can't both read the same pre-write state and have the second
+# `mv` silently clobber the first one's change. One lock acquisition per
+# public function below, covering its whole init-if-missing + mutate body —
+# never call another state_* function from inside a locked body, or the
+# second flock on the same fd blocks forever (flock is not reentrant).
+# Falls back to running body unlocked if flock isn't on PATH — same
+# behaviour as before this existed, not a new failure mode.
+state__locked() {
+  local state_path="$1"; shift
+  mkdir -p "$(dirname "$state_path")" 2>/dev/null
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -x 9; "$@"; ) 9>"${state_path}.lock" 2>/dev/null
+  else
+    "$@"
+  fi
+}
+
+state__write_body() {
+  local state_path="$1"
+  dod__has_jq || return 1
+  jq -n '{
+    latched: false,
+    latched_session_id: null,
+    round: 0,
+    escalation: "none",
+    last_failed_diff_hash: null,
+    creep_diff_hash: null,
+    edits: [],
+    state: "idle",
+    cache: {},
+    decisions: [],
+    decided_diff_hash: null
+  }' > "$state_path" 2>/dev/null
+}
+# state_write <path> — (re)writes defaults. Used both to initialise and,
+# combined with the mutators below, to persist changes.
+state_write() { state__locked "$1" state__write_body "$1"; }
+
+# state_read <path> — sets STATE_* globals. Returns 1 on missing/malformed/
+# non-object JSON, without setting stale globals. Read-only: no lock needed.
+state_read() {
+  local state_path="$1"
+  STATE_LATCHED=""
+  STATE_LATCHED_SESSION_ID=""
+  STATE_ROUND=""
+  STATE_ESCALATION=""
+  STATE_LAST_FAILED_DIFF_HASH=""
+  STATE_CREEP_DIFF_HASH=""
+  STATE_EDITS="[]"
+  STATE_STATE="idle"
+  STATE_CACHE="{}"
+  STATE_DECISIONS="[]"
+  STATE_DECIDED_DIFF_HASH=""
+
+  [ -f "$state_path" ] || return 1
+  dod__has_jq || return 1
+  jq -e 'type == "object"' "$state_path" >/dev/null 2>&1 || return 1
+
+  STATE_LATCHED=$(jq -r '.latched // false' "$state_path" 2>/dev/null)
+  STATE_LATCHED_SESSION_ID=$(jq -r '.latched_session_id // ""' "$state_path" 2>/dev/null)
+  STATE_ROUND=$(jq -r '.round // 0' "$state_path" 2>/dev/null)
+  STATE_ESCALATION=$(jq -r '.escalation // "none"' "$state_path" 2>/dev/null)
+  STATE_LAST_FAILED_DIFF_HASH=$(jq -r '.last_failed_diff_hash // ""' "$state_path" 2>/dev/null)
+  STATE_CREEP_DIFF_HASH=$(jq -r '.creep_diff_hash // ""' "$state_path" 2>/dev/null)
+  STATE_EDITS=$(jq -c '.edits // []' "$state_path" 2>/dev/null)
+  [ -n "$STATE_EDITS" ] || STATE_EDITS="[]"
+  STATE_STATE=$(jq -r '.state // "idle"' "$state_path" 2>/dev/null)
+  [ -n "$STATE_STATE" ] || STATE_STATE="idle"
+  STATE_CACHE=$(jq -c '.cache // {}' "$state_path" 2>/dev/null)
+  [ -n "$STATE_CACHE" ] || STATE_CACHE="{}"
+  STATE_DECISIONS=$(jq -c '.decisions // []' "$state_path" 2>/dev/null)
+  [ -n "$STATE_DECISIONS" ] || STATE_DECISIONS="[]"
+  STATE_DECIDED_DIFF_HASH=$(jq -r '.decided_diff_hash // ""' "$state_path" 2>/dev/null)
+  return 0
+}
+
+# state__mutate_body <path> <jq_filter> — init-if-missing + read-modify-write
+# via a jq filter. Only ever called through state__locked.
+state__mutate_body() {
+  local state_path="$1" filter="$2" tmp
+  [ -f "$state_path" ] || state__write_body "$state_path"
+  dod__has_jq || return 1
+  tmp="${state_path}.tmp.$$"
+  jq "$filter" "$state_path" >"$tmp" 2>/dev/null && mv -f "$tmp" "$state_path" 2>/dev/null
+}
+state__mutate() { state__locked "$1" state__mutate_body "$1" "$2"; }
+
+# state_arm_latch <path> [session_id] — arms the claim latch and records the
+# claiming session (empty -> null: unknown). gate.sh branch 5 ignores a
+# latch claimed by a DIFFERENT session than the Stop's, so a claim never
+# outlives its session and wedges a later one (the Oct 1 orphan); an
+# unknown id on either side keeps the latch claiming, as before.
+state_arm_latch() {
+  local state_path="$1" sid="${2:-}"
+  state__mutate "$state_path" ".latched = true
+    | .latched_session_id = $(jq -n --arg s "$sid" 'if $s == "" then null else $s end')"
+}
+
+# state_disarm_latch <path> — clears latched back to false. Sole caller is
+# gate.sh's branch 8, right before it re-blocks on failing findings with the
+# contract still "open": that round's claim has been fully judged, so the
+# latch must not survive into the NEXT Stop and wrongly claim a later,
+# unrelated question-only turn (issue #33 — a contract that failed
+# verification once stayed "claimed" forever, since nothing else ever
+# cleared the latch outside a contract amend, re-blocking on the stale
+# result instead of releasing per N1). Not called at branch 5 itself or at
+# branch 9/10 — branch 9/10 flip contract.status away from "open", so
+# branch 3 shields every later turn regardless of the latch, and branch 5
+# must not disarm mid a stop_hook_active recursion (branch 1/A2's loop
+# guard needs the latch to keep reading as claimed across those
+# re-invocations of the SAME Stop). Edits still re-arm CLAIMED for their own
+# prompt_id via state_has_edit_for_prompt, independently of the latch.
+state_disarm_latch() { state__mutate "$1" '.latched = false | .latched_session_id = null'; }
+
+state_bump_round() { state__mutate "$1" '.round = ((.round // 0) + 1)'; }
+
+# state_set_state <path> <"idle"|"verifying"> — wording-only signal for
+# gate.sh's block message (see header). /dod:verify sets "verifying" before
+# doing anything else, and back to "idle" right after result_write succeeds.
+state_set_state() {
+  local state_path="$1" value="$2"
+  case "$value" in idle|verifying) : ;; *) return 1 ;; esac
+  state__mutate "$state_path" ".state = $(jq -n --arg v "$value" '$v')"
+}
+
+state_set_escalation() {
+  local state_path="$1" value="$2"
+  state__mutate "$state_path" ".escalation = $(jq -n --arg v "$value" '$v')"
+}
+
+state_set_last_failed_diff_hash() {
+  local state_path="$1" hash="$2"
+  state__mutate "$state_path" ".last_failed_diff_hash = $(jq -n --arg h "$hash" '$h')"
+}
+
+# state_set_creep_diff_hash <path> <diff_hash> — ADR 0004's one-shot marker:
+# gate.sh's creep branch sets this to the diff_hash of the result it just
+# blocked scope creep on. The NEXT Stop with the SAME diff_hash (no new
+# result.json, i.e. the changeset hasn't moved) reads this back and releases
+# silently instead of re-blocking — "block once ... following Stops release
+# until a new result.json exists". Reset to null by contract_write
+# (state_write), same as every other state field, so a fresh/amended
+# contract never inherits a stale marker from a prior pass.
+state_set_creep_diff_hash() {
+  local state_path="$1" hash="$2"
+  state__mutate "$state_path" ".creep_diff_hash = $(jq -n --arg h "$hash" '$h')"
+}
+
+# --- the user's fix/skip decision on the final review's advisories ---------
+# All requirements pass but advisories remain and none is decided: the gate
+# keeps the contract open and releases the Stop — the agent has asked the
+# user and waits on them, not on unfinished work. /dod:verify records the
+# reply via state_record_decisions; the gate then closes on the next Stop,
+# unless a `fix` was decided and the changeset has not changed since
+# (state_decision_needs_verify) — a fix needs a fresh /dod:verify. The
+# decision is about ONE result's advisories (its ids + diff_hash); later
+# rounds' findings never re-open it. Reset with this file by contract_write.
+
+# state_record_decisions <path> <decisions_json> <diff_hash> <advisory_ids_json>
+# — decisions is an array of {id, decision: "fix"|"skip"} with exactly one
+# entry per id in advisory_ids (the decided result's RESULT_ADVISORY_IDS),
+# none missing, extra or repeated; diff_hash is that result's. Rejects
+# anything else, writing nothing.
+state_record_decisions() {
+  local state_path="$1" decisions="$2" diff_hash="$3" ids="$4"
+  dod__has_jq || return 1
+  jq -e -n --argjson d "$decisions" --argjson ids "$ids" '
+    ($d | type == "array" and length > 0)
+    and ($d | all(.[]; (.id | type == "string") and (.decision == "fix" or .decision == "skip")))
+    and ($d | map(.id) | sort) == ($ids | sort)
+  ' >/dev/null 2>&1 || return 1
+  state__mutate "$state_path" ".decisions = $(printf '%s' "$decisions" | jq -c .)
+    | .decided_diff_hash = $(jq -n --arg h "$diff_hash" '$h')"
+}
+
+# state_decision_needs_verify <path> <diff_hash> — 0 if a `fix` was decided
+# and the changeset is still the one it was decided on (not re-verified
+# since), 1 otherwise. Read-only: no lock needed.
+state_decision_needs_verify() {
+  local state_path="$1" diff_hash="$2"
+  [ -f "$state_path" ] || return 1
+  dod__has_jq || return 1
+  jq -e --arg h "$diff_hash" '
+    any((.decisions // [])[]; .decision == "fix") and .decided_diff_hash == $h
+  ' "$state_path" >/dev/null 2>&1
+}
+
+# state_log_edit <path> <prompt_id> <file_path> — appends one edit record
+# (§6.5). Sole writer of state.edits — track.sh's PostToolUse hook, never the
+# gate. Used by gate.sh branch 5 (D8) to detect "edited this prompt without a
+# latch" without relying on the agent to call dod-claim.sh.
+#
+# Deduplicates on (prompt_id, path) and keeps only the last 200 entries: only
+# membership ("was this prompt_id ever logged") is read back, never order or
+# repeat count, so an unbounded append on a long session or a
+# repeatedly-edited file would grow state.json for no observable behaviour
+# change — just slower gate.sh reads on every Stop.
+state__log_edit_body() {
+  local state_path="$1" prompt_id="$2" file="$3" ts tmp
+  [ -f "$state_path" ] || state__write_body "$state_path"
+  dod__has_jq || return 1
+  ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)
+  tmp="${state_path}.tmp.$$"
+  jq --arg p "$prompt_id" --arg f "$file" --arg t "$ts" \
+    '.edits = (([{prompt_id: $p, path: $f, ts: $t}] + .edits)
+                | unique_by([.prompt_id, .path])
+                | .[0:200])' \
+    "$state_path" >"$tmp" 2>/dev/null && mv -f "$tmp" "$state_path" 2>/dev/null
+}
+state_log_edit() { state__locked "$1" state__log_edit_body "$1" "$2" "$3"; }
+
+# state_has_edit_for_prompt <path> <prompt_id> — 0 if state.edits contains
+# any record for prompt_id, 1 otherwise (including missing/malformed state).
+# Read-only: no lock needed.
+state_has_edit_for_prompt() {
+  local state_path="$1" prompt_id="$2"
+  [ -f "$state_path" ] || return 1
+  dod__has_jq || return 1
+  jq -e --arg p "$prompt_id" '(.edits // []) | any(.[]; .prompt_id == $p)' \
+    "$state_path" >/dev/null 2>&1
+}
+
+# state_cache_key <diff_hash> <cmd> — the cache map key, "<diff_hash>:<cmd_hash>".
+# cmd is hashed (not stored raw) so a command containing ':' or other odd
+# characters can't collide with the diff_hash delimiter; sha1 chosen only
+# because it's already on every machine this runs on (git needs it), not for
+# any cryptographic property.
+state_cache_key() {
+  local diff_hash="$1" cmd="$2" cmd_hash
+  cmd_hash=$(printf '%s' "$cmd" | sha1sum 2>/dev/null | cut -d' ' -f1)
+  [ -n "$cmd_hash" ] || cmd_hash=$(printf '%s' "$cmd" | cksum 2>/dev/null | cut -d' ' -f1)
+  printf '%s:%s' "$diff_hash" "$cmd_hash"
+}
+
+# state_cache_get <path> <diff_hash> <cmd> — prints the cached verdict
+# ("pass"/"fail") for this (diff_hash, cmd) pair, or nothing + return 1 on a
+# miss. Read-only: no lock needed. Any change to the diff changes diff_hash,
+# so the whole cache is invalidated for free — no explicit eviction on edit.
+state_cache_get() {
+  local state_path="$1" diff_hash="$2" cmd="$3" key verdict
+  [ -f "$state_path" ] || return 1
+  dod__has_jq || return 1
+  key=$(state_cache_key "$diff_hash" "$cmd")
+  verdict=$(jq -r --arg k "$key" '(.cache // {})[$k] // empty' "$state_path" 2>/dev/null)
+  [ -n "$verdict" ] || return 1
+  printf '%s' "$verdict"
+}
+
+# state_cache_set <path> <diff_hash> <cmd> <verdict> — records a check's
+# verdict. Caps the map at 200 entries (oldest-inserted evicted first,
+# jq object key order is insertion order) for the same reason edits[] is
+# capped: only lookups are read back, never history, so unbounded growth
+# would just slow every gate.sh/verify read for no behaviour change.
+state__cache_set_body() {
+  local state_path="$1" key="$2" verdict="$3" tmp
+  [ -f "$state_path" ] || state__write_body "$state_path"
+  dod__has_jq || return 1
+  tmp="${state_path}.tmp.$$"
+  jq --arg k "$key" --arg v "$verdict" \
+    '.cache = (((.cache // {}) + {($k): $v})
+                | to_entries | .[-200:] | from_entries)' \
+    "$state_path" >"$tmp" 2>/dev/null && mv -f "$tmp" "$state_path" 2>/dev/null
+}
+state_cache_set() {
+  local state_path="$1" diff_hash="$2" cmd="$3" verdict="$4" key
+  key=$(state_cache_key "$diff_hash" "$cmd")
+  state__locked "$state_path" state__cache_set_body "$state_path" "$key" "$verdict"
+}
