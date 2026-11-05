@@ -218,7 +218,10 @@ unsafe defaults.
 
 Logic errors, broken edge cases, missing coverage, wrong behaviour against
 `task`. Read enough context to judge — a hunk that looks correct in
-isolation is the normal shape of a real bug.
+isolation is the normal shape of a real bug. Grep the added lines for
+leftover stubs — `TODO`/`FIXME`, `NotImplementedError`/`todo!()`, and
+skipped tests (`xit`, `.skip`, `pytest.mark.skip`) — and report each as a
+finding.
 
 ## `delta_reconfirm` mode — two additional obligations
 
