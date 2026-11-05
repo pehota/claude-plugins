@@ -3,7 +3,7 @@
 Task-DoD lifecycle plugin: the agent records an explicit completion claim,
 and the Stop gate blocks until a verification result covers the changeset.
 
-Full design: [`docs/design-v2.md`](../docs/design-v2.md).
+Full design: [`docs/design-v2.md`](docs/design-v2.md).
 Baseline requirements every contract folds in: [`base-dod.md`](base-dod.md).
 
 ## Usage
@@ -66,7 +66,7 @@ variables are carried between calls.
 
 A plugin cannot ship permission rules, so the plugin's PreToolUse hook
 `hooks/approve.sh` approves exactly that command shape and nothing else
-([ADR 0005](../docs/adr/0005-auto-approve-dod-cli.md)):
+([ADR 0005](docs/adr/0005-auto-approve-dod-cli.md)):
 
 - **Allowed:** `bash` + this plugin's own `scripts/dod.sh` path (exact
   string, quoted or bare) + a known verb + arguments with nothing the shell

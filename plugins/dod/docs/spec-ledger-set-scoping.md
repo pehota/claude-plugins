@@ -20,7 +20,7 @@
 > `hc__commit_in_ledger` have since been **deleted**, and membership is now
 > `hc__commit_in_any_ledger` — ledger membership across all sessions, with
 > absent-or-empty meaning "no agent commit observed". Read the code listings
-> below as the historical proposal they are; `docs/architecture.md` §7/§12 and
+> below as the historical proposal they are; the harlo repo's `docs/architecture.md` §7/§12 and
 > `docs/design.md` carry the current behaviour. Kept as the record of *why* the
 > set-vs-point argument was made.
 
@@ -94,7 +94,7 @@ must not introduce a parallel ledger call. The only new code is a helper that
   from the other end instead: the ledger sweep is unconditional (it no longer
   depends on a command-text heuristic that routinely missed real agent commits),
   so an empty ledger beside a non-empty commit range now genuinely means an agent
-  did not make those commits. See `architecture.md` §14, entry 2026-09-09.
+  did not make those commits. See harlo's `docs/architecture.md` §14, entry 2026-09-09.
 - Task mode — `hc__resolve_task_base` deliberately never advances past foreign
   commits; the pinned fork point is the anchor. This spec is **session mode
   only**.

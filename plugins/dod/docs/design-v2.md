@@ -8,8 +8,8 @@
 > were cut (YAGNI, see plan.md Phase 2 item 8) and auto-detection of
 > implementation work remains deferred (§9). This document remains the full
 > v2 end-state spec; sections below are annotated where they diverge.
-> **Supersedes:** [`design.md`](design.md) and the pre-v2 `dod/` implementation
-> (recoverable at tag `dod-v1-final`).
+> **Supersedes:** `design.md` (harlo repo, `docs/design.md`) and the pre-v2 `dod/` implementation
+> (recoverable at tag `dod-v1-final` in the harlo repo).
 
 ---
 
