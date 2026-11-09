@@ -19,6 +19,11 @@
       "name": "dod",
       "source": "dod",
       "description": "Task-DoD lifecycle: an explicit dod-collect skill records a per-task Definition-of-Done contract before implementation, then blocks Stop until that contract has a passing verification result."
+    },
+    {
+      "name": "nudges",
+      "source": "nudges",
+      "description": "Self-improvement nudges on typed prompts: accepting all recs, rule-file growth and missing stop points, at most once per pattern per day."
     }
   ]
 }
