@@ -1071,8 +1071,11 @@ On a gate escalation (§6.6) the last review's advisories are listed once,
 not asked.
 
 **All pass with advisories does not close the contract.** `/dod:verify`
-shows one advisory table (id, file:line, summary, its fix/skip
-recommendation with reason), asks the user to decide per id, and stops; the gate releases with the contract open (§6.5, L11). The reply is
+leads its message with one verdict line (advisory count, fix/skip
+recommendation and the reason that decides it), asks the user to decide per
+id, and ends with a `## Detail` heading holding the pass table and one
+advisory table (id, file:line, summary, its fix/skip recommendation with
+reason), then stops; the gate releases with the contract open (§6.5, L11). The reply is
 recorded per id; all skip closes, any fix is fixed and re-verified with a
 blocking-only review, then closes. The decision is asked once per contract.
 
@@ -1113,6 +1116,7 @@ blocking-only review, then closes. The decision is asked once per contract.
 | D29 | **Reverses D4.** `/dod:define`'s verification table blocks on user confirmation (yes/adjust/cancel) before `contract_write` runs, using a fixed template (Verification / Expected Result / Why This Verification per row). The block covers implementation edits too, not just the contract write — no edit toward the task before the user replies. Confirmation is a single gate, not two: "yes" approves the list AND starts implementation in the same turn — the agent does not stop after `contract_write` and wait to be told to begin | keep D4's silent-print; a status label ("Contract Opened") with no content the user has to read; gate only the file write, allow the agent to start coding while the table sits unanswered; treat confirmation and "begin work" as two separate approvals |
 | D30 | Definition is one chain: agree the task (clarify if ambiguous, don't re-ask if settled) → "how will we know it works?" (`works_when`, required) → "how do we prove that?" (the requirements, each with a required `proves`). The D29 table opens with "It works when:" and its third column is "Proves". Agent/prompt/skill text counts as observable behavior, so `scenario` is N/A only when another row already fully proves `works_when` | an optional free-text `rationale` per requirement; deciding scenario applicability on "is there runnable code" |
 | D31 | Advisories come only from the final passing round's review; all pass with advisories waits for the user's fix/skip decision on every one before closing; the decision lives in `state.json`, a `fix` needs a fresh verify, and later rounds are blocking-only | carry advisories across rounds (stale/duplicate/id-clashing findings); close on pass and list advisories as FYI; `contract.status: awaiting_decision` (ungates the fix edits) |
+| D32 | The pending-decision message leads with one verdict line (advisory count, `Rec:` fix/skip, deciding reason); the pass table and the advisory table go last under `## Detail`. After a long wait a big table gets skimmed and rubber-stamped; the verdict line is what the user acts on | tables first, recommendation last (D24's order) |
 
 ---
 

@@ -39,7 +39,9 @@ Baseline requirements every contract folds in: [`base-dod.md`](base-dod.md).
   observations are settled, fixed or dropped, before verify runs. Advisories
   come only from the final passing round's review (a failing round shows
   blocking findings only). All pass with advisories does not close the
-  contract: the agent asks you fix or skip per advisory and stops. All skip
+  contract: the agent leads with one line (advisory count, its fix/skip
+  recommendation and why), puts the tables under a `Detail` heading at the
+  end, asks you fix or skip per advisory and stops. All skip
   closes it; a fix is made, re-verified (blocking-only review), then closes.
   Until decided, `prompt.sh` reminds the agent of the pending advisory ids
   on every later prompt.

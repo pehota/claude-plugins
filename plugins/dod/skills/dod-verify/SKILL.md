@@ -271,7 +271,8 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
    bash "${CLAUDE_PLUGIN_ROOT}/scripts/dod.sh" claim
    ```
 
-8. **Print the pass table.** One row per requirement — **every** requirement,
+8. **Print the pass table** (in the pending-decision outcome below, it goes
+   under that outcome's `## Detail` heading). One row per requirement — **every** requirement,
    with no exceptions for a waived or not-applicable one: id, verdict, and
    (checks) command or (judgements) finding counts — a failing round's
    judgement row states its blocking count only (its advisories, if any, are
@@ -319,10 +320,17 @@ literal `'` as its JSON escape `\u0027`, never `'\''`.
      message will restate check failures; don't wait for it to inform the
      user.
    - **All pass, advisories, the contract's `state.decisions` is `[]`** (the user has not
-     decided yet). The contract stays open awaiting the user. Show **one**
-     advisory table, every advisory once: id, file:line, short summary, and
-     your fix/skip recommendation with its reason. Ask the user to decide fix or skip per
-     id, then stop — the gate lets you stop while the decision is pending.
+     decided yet). The contract stays open awaiting the user. **Lead** the
+     message with one line: the advisory count (`1 advisory` / `<n> advisories`), your
+     fix/skip recommendation and the reason that decides it — e.g. `4 advisories. Rec: fix f3+f4, skip
+     the rest — f3 makes a claude -p check look broken.` After a long wait
+     a big table gets skimmed and rubber-stamped; the verdict line is what
+     the user acts on. Then ask the user to decide fix or skip per id. End
+     the message with a `## Detail` heading holding the pass table and
+     **one** advisory table, every advisory once: id, file:line, short
+     summary, and your fix/skip recommendation with its reason. No table
+     comes before `## Detail`. Then stop — the gate lets you stop while the
+     decision is pending.
    - **All pass, and no advisories or `state.decisions` non-empty.** Tell
      the user the DoD is satisfied; the gate closes the contract when you
      stop. The decision is asked once per contract: once recorded, raise no
