@@ -3,7 +3,7 @@
 #   Model: Opus 5.5 | Ctx: 24.0% | Sess: 1.0% (4hr 19m)            Weekly: 15.0% (3d 16hr 29m)
 #   𖠰 main
 # Sess is the 5-hour usage window, Weekly the 7-day one; the bracket is the time until it resets.
-# Ctx turns yellow at 50% and red at 65%; Sess and Weekly at 70% and 90%.
+# Ctx turns yellow at 50% and red at 65%; Sess and Weekly yellow at 50%, orange at 75%, red at 90%.
 # Claude Code sends all of it as JSON on stdin (rate_limits included), so there is no API call
 # and no Node start-up. Event-driven only: leave `refreshInterval` unset in settings.json.
 # Install and behaviour: see README.md next to this file.
@@ -11,11 +11,11 @@ set -euo pipefail
 shopt -s extglob
 export LC_NUMERIC=C
 
-RED=$'\e[31m'; YELLOW=$'\e[33m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+RED=$'\e[31m'; ORANGE=$'\e[38;5;208m'; YELLOW=$'\e[33m'; DIM=$'\e[2m'; RESET=$'\e[0m'
 # Columns kept free on the right: Claude Code cuts a full-width row short with "…" (4 characters lost at margin 2)
 RIGHT_MARGIN="${STATUSLINE_MARGIN:-6}"
-# Percent from which a value turns yellow, then red
-USAGE_YELLOW=70; USAGE_RED=90
+# Percent from which a value turns yellow, then orange, then red (Ctx has no orange step)
+USAGE_YELLOW=50; USAGE_ORANGE=75; USAGE_RED=90
 CONTEXT_YELLOW=50; CONTEXT_RED=65
 
 # humanize_remaining <seconds> -> 3d 16hr 29m | 4hr 19m | 12m | now
@@ -40,11 +40,12 @@ measure() {
 # visible_length <text> -> prints the same number, for callers that want a value
 visible_length() { measure "$1"; echo "$VISIBLE"; }
 
-# paint <text> <percent> <yellow_from> <red_from> -> text in yellow or red once the percent reaches the threshold
+# paint <text> <percent> <yellow_from> <orange_from> <red_from> -> text in yellow, orange or red once the percent reaches the threshold
 paint() {
-  local text="$1" whole="${2%.*}" yellow_from="$3" red_from="$4"
+  local text="$1" whole="${2%.*}" yellow_from="$3" orange_from="$4" red_from="$5"
   whole="${whole:-0}"
   if (( whole >= red_from )); then echo "${RED}${text}${RESET}"
+  elif (( whole >= orange_from )); then echo "${ORANGE}${text}${RESET}"
   elif (( whole >= yellow_from )); then echo "${YELLOW}${text}${RESET}"
   else echo "$text"
   fi
@@ -55,7 +56,7 @@ usage_segment() {
   local label="$1" pct="$2" resets="$3" now="$4"
   [[ -z "$pct" ]] && return 0
   local text
-  text=$(paint "$label: $(format_percent "$pct")" "$pct" "$USAGE_YELLOW" "$USAGE_RED")
+  text=$(paint "$label: $(format_percent "$pct")" "$pct" "$USAGE_YELLOW" "$USAGE_ORANGE" "$USAGE_RED")
   [[ -n "$resets" ]] && text+=" ${DIM}($(humanize_remaining $(( resets - now ))))${RESET}"
   echo "$text"
 }
@@ -64,7 +65,7 @@ usage_segment() {
 context_segment() {
   local pct="$1"
   [[ -z "$pct" ]] && return 0
-  paint "Ctx: $(format_percent "$pct")" "$pct" "$CONTEXT_YELLOW" "$CONTEXT_RED"
+  paint "Ctx: $(format_percent "$pct")" "$pct" "$CONTEXT_YELLOW" "$CONTEXT_RED" "$CONTEXT_RED"
 }
 
 # join_segments <segment>... -> segments separated by " | ", empty ones dropped

@@ -10,7 +10,7 @@ Model: Sonnet 5.5 | Ctx: 27.0% | Sess: 17.0% (1hr 45m)                    Weekly
 | Segment | Meaning |
 |---|---|
 | `Ctx` | Context window used. Yellow from 50%, red from 65% |
-| `Sess` | 5-hour usage window, with the time until it resets. Yellow from 70%, red from 90% |
+| `Sess` | 5-hour usage window, with the time until it resets. Yellow from 50%, orange from 75%, red from 90% |
 | `Weekly` | 7-day usage window, with the time until it resets. Same colours as `Sess` |
 | `𖠰 <branch>` | Git branch of the session's directory |
 
