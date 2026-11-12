@@ -77,6 +77,6 @@ check "narrow: weekly joins the branch row" "$(echo "$narrow" | sed -n 2p)" "$W 
 check "unknown width: one compact row"    "$(render "$M" "$C" "$S" "$W" "" 0)" "$left   $W"
 check "no weekly: left then branch"       "$(render "$M" "$C" "$S" "" "$B" 100)" "$left
 $B"
-check "exactly fitting width stays one row" "$(render "$M" "$C" "$S" "$W" "" $(( ${#left} + 3 + ${#W} )) | wc -l)" "1"
-check "one column too narrow stacks"      "$(render "$M" "$C" "$S" "$W" "" $(( ${#left} + 2 + ${#W} )) | wc -l)" "2"
+check "exactly fitting width stays one row" "$(render "$M" "$C" "$S" "$W" "" $(( ${#left} + 3 + ${#W} )) | wc -l | tr -d " ")" "1"
+check "one column too narrow stacks"      "$(render "$M" "$C" "$S" "$W" "" $(( ${#left} + 2 + ${#W} )) | wc -l | tr -d " ")" "2"
 exit $FAIL
