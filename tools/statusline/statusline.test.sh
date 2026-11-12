@@ -26,17 +26,17 @@ check "usage with reset"                 "$(plain "$(usage_segment Sess 1 15600 
 check "weekly label"                     "$(plain "$(usage_segment Weekly 15 300000 0)")" "Weekly: 15.0% (3d 11hr 20m)"
 check "no usage data gives nothing"      "$(usage_segment Sess '' '' 100)"              ""
 check "49.9% stays plain"                "$(plain "$(usage_segment Sess 49.9 160 100)")" "Sess: 49.9% (1m)"
-check "50% turns yellow"                 "$(usage_segment Sess 50 160 100)"  "${YELLOW}Sess: 50.0%${RESET} ${DIM}(1m)${RESET}"
-check "74.9% is still yellow"            "$(usage_segment Sess 74.9 160 100)" "${YELLOW}Sess: 74.9%${RESET} ${DIM}(1m)${RESET}"
-check "75% turns orange"                 "$(usage_segment Sess 75 160 100)"  "${ORANGE}Sess: 75.0%${RESET} ${DIM}(1m)${RESET}"
-check "89.9% is still orange"            "$(usage_segment Sess 89.9 160 100)" "${ORANGE}Sess: 89.9%${RESET} ${DIM}(1m)${RESET}"
-check "90% turns red"                    "$(usage_segment Sess 95 160 100)"  "${RED}Sess: 95.0%${RESET} ${DIM}(1m)${RESET}"
-check "weekly uses the same colours"     "$(usage_segment Weekly 80 160 100)" "${ORANGE}Weekly: 80.0%${RESET} ${DIM}(1m)${RESET}"
+check "50% turns yellow"                 "$(usage_segment Sess 50 160 100)"  "${DIM}Sess:${RESET} ${YELLOW}50.0%${RESET} ${DIM}(1m)${RESET}"
+check "74.9% is still yellow"            "$(usage_segment Sess 74.9 160 100)" "${DIM}Sess:${RESET} ${YELLOW}74.9%${RESET} ${DIM}(1m)${RESET}"
+check "75% turns orange"                 "$(usage_segment Sess 75 160 100)"  "${DIM}Sess:${RESET} ${ORANGE}75.0%${RESET} ${DIM}(1m)${RESET}"
+check "89.9% is still orange"            "$(usage_segment Sess 89.9 160 100)" "${DIM}Sess:${RESET} ${ORANGE}89.9%${RESET} ${DIM}(1m)${RESET}"
+check "90% turns red"                    "$(usage_segment Sess 95 160 100)"  "${DIM}Sess:${RESET} ${RED}95.0%${RESET} ${DIM}(1m)${RESET}"
+check "weekly uses the same colours"     "$(usage_segment Weekly 80 160 100)" "${DIM}Weekly:${RESET} ${ORANGE}80.0%${RESET} ${DIM}(1m)${RESET}"
 
-check "context below 50% has no colour"  "$(context_segment 49.9)"  "Ctx: 49.9%"
-check "context 50% turns yellow"         "$(context_segment 50)"    "${YELLOW}Ctx: 50.0%${RESET}"
-check "context 64.9% is still yellow"    "$(context_segment 64.9)"  "${YELLOW}Ctx: 64.9%${RESET}"
-check "context 65% turns red"            "$(context_segment 65)"    "${RED}Ctx: 65.0%${RESET}"
+check "context below 50% has no colour"  "$(context_segment 49.9)"  "${DIM}Ctx:${RESET} 49.9%"
+check "context 50% turns yellow"         "$(context_segment 50)"    "${DIM}Ctx:${RESET} ${YELLOW}50.0%${RESET}"
+check "context 64.9% is still yellow"    "$(context_segment 64.9)"  "${DIM}Ctx:${RESET} ${YELLOW}64.9%${RESET}"
+check "context 65% turns red"            "$(context_segment 65)"    "${DIM}Ctx:${RESET} ${RED}65.0%${RESET}"
 check "no context data gives nothing"    "$(context_segment '')"    ""
 
 check "empty segments are dropped"       "$(join_segments a '' b)" "a | b"
@@ -62,6 +62,8 @@ git -C "$repo" init -q -b feature-x 2>/dev/null
 branch_out=$(echo "{\"model\":{\"display_name\":\"Opus\"},\"workspace\":{\"current_dir\":\"$repo\"}}" | STATUSLINE_NOW=0 main)
 check "branch is on the second line"     "$(plain "$branch_out")" "Model: Opus
 𖠰 feature-x"
+check "model label is dim, name is not"  "${branch_out%%$'\n'*}" "${DIM}Model:${RESET} Opus"
+check "branch is magenta"                "${branch_out#*$'\n'}"  "${MAGENTA}𖠰 feature-x${RESET}"
 # render: responsive layout (plain segments, no colour codes)
 M="Model: X"; C="Ctx: 5.0%"; S="Sess: 1.0% (4hr 19m)"; W="Weekly: 9.0% (3d 1hr 1m)"; B="𖠰 main"
 left="$M | $C | $S"

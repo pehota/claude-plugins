@@ -12,7 +12,9 @@ Model: Sonnet 5.5 | Ctx: 27.0% | Sess: 17.0% (1hr 45m)                    Weekly
 | `Ctx` | Context window used. Yellow from 50%, red from 65% |
 | `Sess` | 5-hour usage window, with the time until it resets. Yellow from 50%, orange from 75%, red from 90% |
 | `Weekly` | 7-day usage window, with the time until it resets. Same colours as `Sess` |
-| `𖠰 <branch>` | Git branch of the session's directory |
+| `𖠰 <branch>` | Git branch of the session's directory, in magenta (the colour fish's prompt uses for the branch) |
+
+Labels (`Model:`, `Ctx:`, `Sess:`, `Weekly:`) are dim; only the value carries the warning colour.
 
 ## Why a script and not a Node status line
 
@@ -53,5 +55,5 @@ command on a timer in every session.
 bash tools/statusline/statusline.test.sh   # all PASS
 ```
 
-Covers the reset-time format, percent format, colour thresholds, layout at wide, medium, narrow and
+Covers the reset-time format, percent format, colour thresholds, dim labels, the magenta branch, layout at wide, medium, narrow and
 unknown widths (including the exact fit boundary), missing `rate_limits`, and the git branch row.

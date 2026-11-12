@@ -4,6 +4,7 @@
 #   𖠰 main
 # Sess is the 5-hour usage window, Weekly the 7-day one; the bracket is the time until it resets.
 # Ctx turns yellow at 50% and red at 65%; Sess and Weekly yellow at 50%, orange at 75%, red at 90%.
+# Labels are dim and only the value takes the warning colour; the branch is magenta.
 # Claude Code sends all of it as JSON on stdin (rate_limits included), so there is no API call
 # and no Node start-up. Event-driven only: leave `refreshInterval` unset in settings.json.
 # Install and behaviour: see README.md next to this file.
@@ -11,7 +12,7 @@ set -euo pipefail
 shopt -s extglob
 export LC_NUMERIC=C
 
-RED=$'\e[31m'; ORANGE=$'\e[38;5;208m'; YELLOW=$'\e[33m'; DIM=$'\e[2m'; RESET=$'\e[0m'
+RED=$'\e[31m'; ORANGE=$'\e[38;5;208m'; YELLOW=$'\e[33m'; MAGENTA=$'\e[35m'; DIM=$'\e[2m'; RESET=$'\e[0m'
 # Columns kept free on the right: Claude Code cuts a full-width row short with "…" (4 characters lost at margin 2)
 RIGHT_MARGIN="${STATUSLINE_MARGIN:-6}"
 # Percent from which a value turns yellow, then orange, then red (Ctx has no orange step)
@@ -56,7 +57,7 @@ usage_segment() {
   local label="$1" pct="$2" resets="$3" now="$4"
   [[ -z "$pct" ]] && return 0
   local text
-  text=$(paint "$label: $(format_percent "$pct")" "$pct" "$USAGE_YELLOW" "$USAGE_ORANGE" "$USAGE_RED")
+  text="${DIM}$label:${RESET} $(paint "$(format_percent "$pct")" "$pct" "$USAGE_YELLOW" "$USAGE_ORANGE" "$USAGE_RED")"
   [[ -n "$resets" ]] && text+=" ${DIM}($(humanize_remaining $(( resets - now ))))${RESET}"
   echo "$text"
 }
@@ -65,7 +66,7 @@ usage_segment() {
 context_segment() {
   local pct="$1"
   [[ -z "$pct" ]] && return 0
-  paint "Ctx: $(format_percent "$pct")" "$pct" "$CONTEXT_YELLOW" "$CONTEXT_RED" "$CONTEXT_RED"
+  echo "${DIM}Ctx:${RESET} $(paint "$(format_percent "$pct")" "$pct" "$CONTEXT_YELLOW" "$CONTEXT_RED" "$CONTEXT_RED")"
 }
 
 # join_segments <segment>... -> segments separated by " | ", empty ones dropped
@@ -132,11 +133,11 @@ main() {
   local width=0
   (( ${COLUMNS:-0} > 0 )) && width=$(( COLUMNS - RIGHT_MARGIN ))
   render \
-    "${DIM}Model: ${model}${RESET}" \
+    "${DIM}Model:${RESET} ${model}" \
     "$(context_segment "$ctx")" \
     "$(usage_segment Sess "$five" "$five_reset" "$now")" \
     "$(usage_segment Weekly "$week" "$week_reset" "$now")" \
-    "${branch:+𖠰 $branch}" \
+    "${branch:+${MAGENTA}𖠰 $branch${RESET}}" \
     "$width"
 }
 
